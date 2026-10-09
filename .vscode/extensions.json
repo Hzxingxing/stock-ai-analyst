@@ -1,0 +1,26 @@
+{
+  "recommendations": [
+    // Python开发必备
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "ms-python.black-formatter",
+
+    // 代码质量
+    "charliermarsh.ruff",
+
+    // 数据库工具
+    "mtxr.sqltools",
+    "mtxr.sqltools-driver-mysql",
+
+    // Docker支持
+    "ms-azuretools.vscode-docker",
+
+    // YAML支持
+    "redhat.vscode-yaml",
+
+    // 其他有用的工具
+    "visualstudioexptteam.vscodeintellicode",
+    "eamodio.gitlens",
+    "wayou.vscode-todo-highlight"
+  ]
+}

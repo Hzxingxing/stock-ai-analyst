@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-12">
+        <div class="alert alert-danger">
+            <h4 class="alert-heading">错误</h4>
+            <p>{{ message }}</p>
+            <hr>
+            <p class="mb-0">
+                <a href="/dashboard" class="btn btn-primary">返回首页</a>
+                <a href="/stocks" class="btn btn-secondary">股票管理</a>
+            </p>
+        </div>
+    </div>
+</div>
+{% endblock %}

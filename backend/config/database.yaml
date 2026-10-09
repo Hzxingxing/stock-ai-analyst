@@ -1,0 +1,9 @@
+mysql:
+  host: localhost
+  port: 3306
+  user: stock_user
+  database: stock_analysis
+  charset: utf8mb4
+  pool_size: 10
+  max_overflow: 20
+  pool_recycle: 3600

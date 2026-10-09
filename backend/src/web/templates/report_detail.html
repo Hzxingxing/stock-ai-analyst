@@ -1,0 +1,360 @@
+{% extends "base.html" %}
+
+{% block content %}
+{% raw %}
+<div id="app" v-cloak>
+    <!-- 面包屑导航 -->
+    <el-breadcrumb separator="/" style="margin-bottom: 20px;">
+        <el-breadcrumb-item :to="{ path: '/dashboard' }">
+            <el-icon><component :is="'HomeFilled'" /></el-icon>
+            首页
+        </el-breadcrumb-item>
+        <el-breadcrumb-item :to="{ path: '/reports' }">分析报告</el-breadcrumb-item>
+        <el-breadcrumb-item>{{ reportDate }}</el-breadcrumb-item>
+    </el-breadcrumb>
+
+    <!-- 加载中 -->
+    <div v-loading="loading" style="min-height: 400px;">
+        <!-- 报告标题卡片 -->
+        <el-card v-if="!loading && report" shadow="never" style="margin-bottom: 20px;">
+            <template #header>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <h3 style="margin: 0;">
+                        <el-icon><component :is="'Document'" /></el-icon>
+                        <span style="margin-left: 8px;">{{ reportDate }} 分析报告</span>
+                    </h3>
+                    <el-button type="primary" plain @click="goBack">
+                        <el-icon><component :is="'Back'" /></el-icon>
+                        <span style="margin-left: 4px;">返回列表</span>
+                    </el-button>
+                </div>
+            </template>
+
+            <!-- 统计卡片 -->
+            <el-row :gutter="16">
+                <el-col :span="6">
+                    <el-statistic title="报告日期" :value="reportDate">
+                        <template #prefix>
+                            <el-icon color="#409EFF"><component :is="'Calendar'" /></el-icon>
+                        </template>
+                    </el-statistic>
+                </el-col>
+                <el-col :span="6">
+                    <el-statistic title="分析股票数" :value="stockCount">
+                        <template #prefix>
+                            <el-icon color="#67C23A"><component :is="'TrendCharts'" /></el-icon>
+                        </template>
+                        <template #suffix>只</template>
+                    </el-statistic>
+                </el-col>
+                <el-col :span="6">
+                    <el-statistic title="平均评分" :value="avgScore">
+                        <template #prefix>
+                            <el-icon color="#E6A23C"><component :is="'StarFilled'" /></el-icon>
+                        </template>
+                    </el-statistic>
+                </el-col>
+                <el-col :span="6">
+                    <el-statistic title="生成时间" :value="createdAtFormatted">
+                        <template #prefix>
+                            <el-icon color="#909399"><component :is="'Clock'" /></el-icon>
+                        </template>
+                    </el-statistic>
+                </el-col>
+            </el-row>
+        </el-card>
+
+        <!-- 市场概况 -->
+        <el-card v-if="!loading && report" shadow="never" style="margin-bottom: 20px;">
+            <template #header>
+                <h5 style="margin: 0;">
+                    <el-icon><component :is="'DataAnalysis'" /></el-icon>
+                    <span style="margin-left: 8px;">市场概况</span>
+                </h5>
+            </template>
+            <pre style="white-space: pre-wrap; font-family: 'Courier New', monospace; background-color: #f5f7fa; padding: 15px; border-radius: 5px; margin: 0;">{{ report.market_overview }}</pre>
+        </el-card>
+
+        <!-- Top 10投资机会 -->
+        <el-card v-if="!loading && report" shadow="never" style="margin-bottom: 20px;">
+            <template #header>
+                <h5 style="margin: 0;">
+                    <el-icon><component :is="'Trophy'" /></el-icon>
+                    <span style="margin-left: 8px;">Top 10 投资机会</span>
+                </h5>
+            </template>
+
+            <el-table :data="topOpportunities" stripe border>
+                <el-table-column label="排名" width="80" align="center">
+                    <template #default="scope">
+                        <el-tag :type="scope.$index < 3 ? 'warning' : 'info'" effect="dark" round size="large">
+                            {{ scope.$index + 1 }}
+                        </el-tag>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="股票" min-width="180">
+                    <template #default="scope">
+                        <a :href="'/stocks/' + scope.row.stock_code" style="text-decoration: none; font-weight: bold; color: #409EFF;">
+                            {{ scope.row.stock_name }}
+                        </a>
+                        <br>
+                        <el-text type="info" size="small">{{ scope.row.stock_code }}</el-text>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="技术面" width="100" align="center">
+                    <template #default="scope">
+                        <el-tag type="primary" round>{{ scope.row.technical_score }}</el-tag>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="基本面" width="100" align="center">
+                    <template #default="scope">
+                        <el-tag type="success" round>{{ scope.row.fundamental_score }}</el-tag>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="总分" width="100" align="center">
+                    <template #default="scope">
+                        <strong style="color: #409EFF; font-size: 16px;">{{ scope.row.total_score }}</strong>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="建议" width="100" align="center">
+                    <template #default="scope">
+                        <el-tag :type="getSuggestionType(scope.row.suggestion)" effect="dark">
+                            {{ scope.row.suggestion }}
+                        </el-tag>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="风险" width="100" align="center">
+                    <template #default="scope">
+                        <el-tag :type="getRiskType(scope.row.risk_level)" effect="plain">
+                            {{ scope.row.risk_level }}
+                        </el-tag>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="关键要点" min-width="300">
+                    <template #default="scope">
+                        <ul style="margin: 0; padding-left: 20px;">
+                            <li v-for="(point, idx) in scope.row.key_points.slice(0, 3)" :key="idx" style="margin: 4px 0;">
+                                {{ point }}
+                            </li>
+                        </ul>
+                    </template>
+                </el-table-column>
+
+                <el-table-column label="操作" width="120" align="center" fixed="right">
+                    <template #default="scope">
+                        <el-button type="primary" size="small" @click="viewStock(scope.row.stock_code)">
+                            <el-icon><component :is="'View'" /></el-icon>
+                            <span style="margin-left: 4px;">查看</span>
+                        </el-button>
+                    </template>
+                </el-table-column>
+            </el-table>
+        </el-card>
+
+        <!-- 完整报告 -->
+        <el-card v-if="!loading && report" shadow="never">
+            <template #header>
+                <h5 style="margin: 0;">
+                    <el-icon><component :is="'Reading'" /></el-icon>
+                    <span style="margin-left: 8px;">完整报告</span>
+                </h5>
+            </template>
+            <div class="markdown-body" v-html="renderedReport"></div>
+        </el-card>
+
+        <!-- 错误提示 -->
+        <el-alert v-if="!loading && error" type="error" :closable="false" show-icon>
+            <template #title>加载失败</template>
+            {{ error }}
+            <el-button type="primary" style="margin-top: 10px;" @click="goBack">返回报告列表</el-button>
+        </el-alert>
+    </div>
+</div>
+{% endraw %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+const { ref, computed, onMounted } = Vue;
+
+const reportDetailApp = createApp({
+    setup() {
+        const reportId = {{ report_id }};
+        const report = ref(null);
+        const loading = ref(true);
+        const error = ref(null);
+
+        // 计算属性
+        const reportDate = computed(() => report.value?.report_date || '-');
+
+        const stockCount = computed(() => {
+            const overview = report.value?.market_overview || '';
+            const match = overview.match(/分析股票总数：(\d+)/);
+            return match ? parseInt(match[1]) : 0;
+        });
+
+        const avgScore = computed(() => {
+            const overview = report.value?.market_overview || '';
+            const techMatch = overview.match(/平均技术面评分：([\d.]+)/);
+            const fundMatch = overview.match(/平均基本面评分：([\d.]+)/);
+
+            if (techMatch && fundMatch) {
+                return ((parseFloat(techMatch[1]) + parseFloat(fundMatch[1])) / 2).toFixed(1);
+            }
+            return '-';
+        });
+
+        const createdAtFormatted = computed(() => {
+            if (!report.value?.created_at) return '-';
+            const date = new Date(report.value.created_at);
+            return date.toLocaleString('zh-CN', {
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        });
+
+        const topOpportunities = computed(() => {
+            return report.value?.top_opportunities || [];
+        });
+
+        const renderedReport = computed(() => {
+            if (!report.value?.full_report) return '';
+            return marked.parse(report.value.full_report);
+        });
+
+        // 加载报告详情
+        const loadReport = async () => {
+            loading.value = true;
+            error.value = null;
+
+            try {
+                const { data } = await axios.get(`/api/reports/${reportId}`);
+
+                if (data.success) {
+                    report.value = data.data;
+                } else {
+                    error.value = data.message || '加载失败';
+                }
+            } catch (err) {
+                console.error('加载报告失败:', err);
+                error.value = '加载报告失败: ' + err.message;
+            } finally {
+                loading.value = false;
+            }
+        };
+
+        // 返回列表
+        const goBack = () => {
+            window.location.href = '/reports';
+        };
+
+        // 查看股票
+        const viewStock = (stockCode) => {
+            window.location.href = `/stocks/${stockCode}`;
+        };
+
+        // 获取建议类型
+        const getSuggestionType = (suggestion) => {
+            const typeMap = {
+                '买入': 'success',
+                '持有': 'primary',
+                '观望': 'warning',
+                '卖出': 'danger'
+            };
+            return typeMap[suggestion] || 'info';
+        };
+
+        // 获取风险类型
+        const getRiskType = (riskLevel) => {
+            const typeMap = {
+                '低': 'success',
+                '中': 'warning',
+                '高': 'danger'
+            };
+            return typeMap[riskLevel] || 'info';
+        };
+
+        // 初始化
+        onMounted(() => {
+            loadReport();
+        });
+
+        return {
+            report,
+            loading,
+            error,
+            reportDate,
+            stockCount,
+            avgScore,
+            createdAtFormatted,
+            topOpportunities,
+            renderedReport,
+            goBack,
+            viewStock,
+            getSuggestionType,
+            getRiskType
+        };
+    }
+});
+
+// 注册 Element Plus
+reportDetailApp.use(ElementPlus, {
+    locale: ElementPlusLocaleZhCn,
+});
+
+// 注册所有图标
+for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+    reportDetailApp.component(key, component);
+}
+
+reportDetailApp.mount('#app');
+</script>
+
+<style scoped>
+[v-cloak] {
+    display: none;
+}
+
+.markdown-body {
+    font-size: 14px;
+    line-height: 1.8;
+}
+
+.markdown-body h1 {
+    font-size: 24px;
+    margin-top: 20px;
+    margin-bottom: 10px;
+}
+
+.markdown-body h2 {
+    font-size: 20px;
+    margin-top: 16px;
+    margin-bottom: 8px;
+    border-bottom: 2px solid #409EFF;
+    padding-bottom: 8px;
+}
+
+.markdown-body h3 {
+    font-size: 16px;
+    margin-top: 12px;
+    margin-bottom: 6px;
+}
+
+.markdown-body ul, .markdown-body ol {
+    padding-left: 24px;
+}
+
+.markdown-body li {
+    margin: 4px 0;
+}
+</style>
+{% endblock %}

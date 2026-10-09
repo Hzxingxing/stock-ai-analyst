@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# VSCode个人配置（保留团队配置）
+.vscode/settings.local.json
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 日志
+logs/
+*.log
+
+# 数据库
+*.db
+*.sqlite
+*.sqlite3
+
+# 临时文件
+/tmp/
+*.tmp
+*.bak
+
+# Alembic
+# 不忽略versions目录,但忽略其中的缓存
+src/migrations/versions/__pycache__/
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 数据文件
+data/
+*.csv
+*.xlsx
+!config/*.yaml
+
+# Docker
+*.pid
+
+# 缓存文件
+cache/
+*.pkl

@@ -1,0 +1,38 @@
+# 股票AI分析系统 - 统一配置文件
+
+# MySQL数据库配置
+mysql:
+  host: localhost
+  port: 3306
+  user: root
+  database: stock_analysis
+  charset: utf8mb4
+  pool_size: 10
+  max_overflow: 20
+  pool_recycle: 3600
+
+# Gemini AI配置 (通过自部署NewAPI)
+gemini:
+  model: gemini-3-flash-preview
+  max_concurrent: 5
+  timeout: 60
+  retry_times: 3
+  temperature: 0.7
+
+# 应用配置
+app:
+  environment: development
+  log_level: INFO
+  log_retention_days: 30
+
+# 定时任务配置
+scheduler:
+  enabled: true
+  daily_update_time: "16:00" # 每日数据更新时间
+  timezone: "Asia/Shanghai"
+
+# 数据更新配置
+data_update:
+  kline_days: 360 # K线数据获取天数
+  news_days: 90 # 新闻数据获取天数
+  announcement_days: 90 # 公告数据获取天数

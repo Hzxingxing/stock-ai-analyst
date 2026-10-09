@@ -1,0 +1,61 @@
+{
+  // Python解释器路径
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+
+  // 终端自动激活虚拟环境
+  "python.terminal.activateEnvironment": true,
+
+  // 使用虚拟环境的Python
+  "python.pythonPath": "${workspaceFolder}/.venv/bin/python",
+
+  // 代码格式化
+  "python.formatting.provider": "black",
+  "python.formatting.blackPath": "${workspaceFolder}/.venv/bin/black",
+
+  // 代码检查
+  "python.linting.enabled": true,
+  "python.linting.ruffEnabled": true,
+  "python.linting.ruffPath": "${workspaceFolder}/.venv/bin/ruff",
+
+  // 保存时自动格式化
+  "editor.formatOnSave": true,
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    }
+  },
+
+  // 文件排除
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true,
+    "**/.pytest_cache": true,
+    "**/.ruff_cache": true,
+    "**/node_modules": true
+  },
+
+  // 测试配置
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": [
+    "backend/tests"
+  ],
+
+  // 终端集成shell启动参数
+  "terminal.integrated.env.osx": {
+    "PYTHONPATH": "${workspaceFolder}/backend"
+  },
+  "terminal.integrated.env.linux": {
+    "PYTHONPATH": "${workspaceFolder}/backend"
+  },
+
+  // 编辑器设置
+  "editor.rulers": [88, 120],
+  "editor.tabSize": 4,
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+
+  // Git设置
+  "git.ignoreLimitWarning": true
+}

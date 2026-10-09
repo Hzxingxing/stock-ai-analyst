@@ -1,0 +1,1356 @@
+{% extends "base.html" %}
+
+{% block content %}
+{% raw %}
+<div id="app" v-cloak>
+    <!-- 面包屑导航 -->
+    <el-breadcrumb separator="/" style="margin-bottom: 20px;">
+        <el-breadcrumb-item :to="{ path: '/dashboard' }">
+            <el-icon><HomeFilled /></el-icon>
+            首页
+        </el-breadcrumb-item>
+        <el-breadcrumb-item :to="{ path: '/stocks' }">股票管理</el-breadcrumb-item>
+        <el-breadcrumb-item>{{ stock.stock_name }} ({{ stock.stock_code }})</el-breadcrumb-item>
+    </el-breadcrumb>
+
+    <!-- 股票信息卡片 -->
+    <el-card shadow="never" style="margin-bottom: 20px;">
+        <template #header>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <h3 style="margin: 0; display: inline-block;">
+                        {{ stock.stock_name }} ({{ stock.stock_code }})
+                    </h3>
+                    <el-tag :type="stock.market === 'SH' ? 'primary' : 'success'" style="margin-left: 10px;">
+                        {{ stock.market }}
+                    </el-tag>
+                    <el-tag :type="stock.is_active ? 'success' : 'info'" style="margin-left: 10px;">
+                        {{ stock.is_active ? '启用' : '禁用' }}
+                    </el-tag>
+                </div>
+                <el-button type="primary" @click="handleSyncData" :loading="syncLoading">
+                    <el-icon><Refresh /></el-icon>
+                    <span style="margin-left: 4px;">同步数据</span>
+                </el-button>
+            </div>
+        </template>
+
+        <el-row :gutter="20">
+            <el-col :span="8">
+                <el-descriptions :column="1" border>
+                    <el-descriptions-item label="股票代码">{{ stock.stock_code }}</el-descriptions-item>
+                    <el-descriptions-item label="股票名称">{{ stock.stock_name }}</el-descriptions-item>
+                    <el-descriptions-item label="市场">
+                        {{ stock.market === 'SH' ? '上海证券交易所' : '深圳证券交易所' }}
+                    </el-descriptions-item>
+                </el-descriptions>
+            </el-col>
+            <el-col :span="8">
+                <el-descriptions :column="1" border>
+                    <el-descriptions-item label="状态">
+                        <el-tag :type="stock.is_active ? 'success' : 'info'" size="small">
+                            {{ stock.is_active ? '启用' : '禁用' }}
+                        </el-tag>
+                    </el-descriptions-item>
+                    <el-descriptions-item label="添加时间">{{ formatDateTime(stock.created_at) }}</el-descriptions-item>
+                    <el-descriptions-item label="更新时间">{{ formatDateTime(stock.updated_at) }}</el-descriptions-item>
+                </el-descriptions>
+            </el-col>
+            <el-col :span="8">
+                <el-button type="primary" @click="handleAnalyze" :loading="analyzeLoading" style="width: 100%; margin-bottom: 10px;">
+                    <el-icon><MagicStick /></el-icon>
+                    <span style="margin-left: 4px;">AI分析</span>
+                </el-button>
+                <el-button @click="goBack" style="width: 100%;">
+                    <el-icon><Back /></el-icon>
+                    <span style="margin-left: 4px;">返回列表</span>
+                </el-button>
+            </el-col>
+        </el-row>
+    </el-card>
+
+    <!-- K线图表 -->
+    <el-card shadow="never" style="margin-bottom: 20px;">
+        <template #header>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h5 style="margin: 0;">
+                    <el-icon><TrendCharts /></el-icon>
+                    <span style="margin-left: 8px;">K线图表</span>
+                </h5>
+                <el-radio-group v-model="klineDays" @change="loadKLineData" size="small">
+                    <el-radio-button :label="60">60日</el-radio-button>
+                    <el-radio-button :label="120">120日</el-radio-button>
+                    <el-radio-button :label="250">250日</el-radio-button>
+                </el-radio-group>
+            </div>
+        </template>
+        <div v-loading="klineLoading" style="position: relative;">
+            <div id="klineChart" style="width: 100%; height: 500px;"></div>
+        </div>
+    </el-card>
+
+    <!-- 财务数据 -->
+    <el-row style="margin-bottom: 20px;">
+        <el-col :span="24">
+            <el-card shadow="never">
+                <template #header>
+                    <h5 style="margin: 0;">
+                        <el-icon><Coin /></el-icon>
+                        <span style="margin-left: 8px;">财务数据</span>
+                    </h5>
+                </template>
+                <div v-loading="financialLoading" style="position: relative;">
+                    <el-empty v-if="financials.length === 0" description="暂无财务数据"></el-empty>
+                    <div v-else>
+                        <!-- 营收和净利润图表 -->
+                        <div id="revenueChart" style="width: 100%; height: 350px;"></div>
+                        <!-- 财务指标图表 -->
+                        <div id="financialIndicatorsChart" style="width: 100%; height: 300px; margin-top: 20px;"></div>
+                    </div>
+                </div>
+            </el-card>
+        </el-col>
+    </el-row>
+
+    <!-- 估值指标和筹码分布 -->
+    <el-row :gutter="20" style="margin-bottom: 20px;">
+        <!-- 估值指标 -->
+        <el-col :span="12">
+            <el-card shadow="never" style="height: 100%;">
+                <template #header>
+                    <h5 style="margin: 0;">
+                        <el-icon><DataAnalysis /></el-icon>
+                        <span style="margin-left: 8px;">估值指标</span>
+                    </h5>
+                </template>
+                <div v-loading="valuationLoading">
+                    <el-empty v-if="!valuation" description="暂无估值数据"></el-empty>
+                    <div v-else>
+                        <!-- 当前估值 -->
+                        <el-descriptions :column="2" border size="small" style="margin-bottom: 16px;">
+                            <el-descriptions-item label="PE(TTM)">
+                                <span :style="{ color: getValuationColor(valuation.current.pe_ttm, valuation.current.industry_pe) }">
+                                    {{ valuation.current.pe_ttm?.toFixed(2) || '-' }}
+                                </span>
+                                <el-tag v-if="valuation.current.industry_pe" size="small" type="info" style="margin-left: 8px;">
+                                    行业 {{ valuation.current.industry_pe?.toFixed(2) }}
+                                </el-tag>
+                            </el-descriptions-item>
+                            <el-descriptions-item label="PB">
+                                <span :style="{ color: getValuationColor(valuation.current.pb, valuation.current.industry_pb) }">
+                                    {{ valuation.current.pb?.toFixed(2) || '-' }}
+                                </span>
+                                <el-tag v-if="valuation.current.industry_pb" size="small" type="info" style="margin-left: 8px;">
+                                    行业 {{ valuation.current.industry_pb?.toFixed(2) }}
+                                </el-tag>
+                            </el-descriptions-item>
+                            <el-descriptions-item label="股息率">
+                                <span style="color: #67C23A;">{{ valuation.current.dividend_yield?.toFixed(2) || '-' }}%</span>
+                            </el-descriptions-item>
+                            <el-descriptions-item label="行业">
+                                <el-tag size="small">{{ valuation.current.industry || '-' }}</el-tag>
+                            </el-descriptions-item>
+                            <el-descriptions-item label="总市值">
+                                {{ formatMarketValue(valuation.current.total_mv) }}
+                            </el-descriptions-item>
+                            <el-descriptions-item label="流通市值">
+                                {{ formatMarketValue(valuation.current.circ_mv) }}
+                            </el-descriptions-item>
+                        </el-descriptions>
+                        <!-- 估值趋势图 -->
+                        <div id="valuationChart" style="width: 100%; height: 250px;"></div>
+                    </div>
+                </div>
+            </el-card>
+        </el-col>
+
+        <!-- 筹码分布 -->
+        <el-col :span="12">
+            <el-card shadow="never" style="height: 100%;">
+                <template #header>
+                    <h5 style="margin: 0;">
+                        <el-icon><PieChart /></el-icon>
+                        <span style="margin-left: 8px;">筹码分布</span>
+                    </h5>
+                </template>
+                <div v-loading="chipLoading">
+                    <el-empty v-if="!chipData || chipData.length === 0" description="暂无筹码数据"></el-empty>
+                    <div v-else>
+                        <!-- 最新筹码数据 -->
+                        <el-descriptions :column="2" border size="small" style="margin-bottom: 16px;">
+                            <el-descriptions-item label="获利比例">
+                                <span :style="{ color: latestChip.profit_ratio > 50 ? '#F56C6C' : '#67C23A' }">
+                                    {{ latestChip.profit_ratio?.toFixed(2) || '-' }}%
+                                </span>
+                            </el-descriptions-item>
+                            <el-descriptions-item label="平均成本">
+                                {{ latestChip.avg_cost?.toFixed(2) || '-' }} 元
+                            </el-descriptions-item>
+                            <el-descriptions-item label="90%成本区间">
+                                {{ latestChip.cost_90_low?.toFixed(2) || '-' }} ~ {{ latestChip.cost_90_high?.toFixed(2) || '-' }}
+                            </el-descriptions-item>
+                            <el-descriptions-item label="90%集中度">
+                                {{ latestChip.concentration_90?.toFixed(2) || '-' }}%
+                            </el-descriptions-item>
+                            <el-descriptions-item label="70%成本区间">
+                                {{ latestChip.cost_70_low?.toFixed(2) || '-' }} ~ {{ latestChip.cost_70_high?.toFixed(2) || '-' }}
+                            </el-descriptions-item>
+                            <el-descriptions-item label="70%集中度">
+                                {{ latestChip.concentration_70?.toFixed(2) || '-' }}%
+                            </el-descriptions-item>
+                        </el-descriptions>
+                        <!-- 筹码趋势图 -->
+                        <div id="chipChart" style="width: 100%; height: 250px;"></div>
+                    </div>
+                </div>
+            </el-card>
+        </el-col>
+    </el-row>
+
+    <!-- 资金流向和股东数据 -->
+    <el-row :gutter="20" style="margin-bottom: 20px;">
+        <!-- 资金流向 -->
+        <el-col :span="12">
+            <el-card shadow="never" style="height: 100%;">
+                <template #header>
+                    <h5 style="margin: 0;">
+                        <el-icon><Money /></el-icon>
+                        <span style="margin-left: 8px;">资金流向</span>
+                    </h5>
+                </template>
+                <div v-loading="fundFlowLoading">
+                    <el-empty v-if="!fundFlow" description="暂无资金流向数据"></el-empty>
+                    <div v-else>
+                        <!-- 资金汇总 -->
+                        <el-descriptions :column="2" border size="small" style="margin-bottom: 16px;">
+                            <el-descriptions-item label="近5日主力">
+                                <span :style="{ color: fundFlow.summary.main_net_inflow_total > 0 ? '#F56C6C' : '#67C23A', fontWeight: 'bold' }">
+                                    {{ formatFundFlow(fundFlow.summary.main_net_inflow_total) }}
+                                </span>
+                                <el-tag :type="fundFlow.summary.main_flow_trend === '流入' ? 'danger' : 'success'" size="small" style="margin-left: 8px;">
+                                    {{ fundFlow.summary.main_flow_trend }}
+                                </el-tag>
+                            </el-descriptions-item>
+                            <el-descriptions-item label="近5日散户">
+                                <span :style="{ color: fundFlow.summary.small_net_inflow_total > 0 ? '#F56C6C' : '#67C23A', fontWeight: 'bold' }">
+                                    {{ formatFundFlow(fundFlow.summary.small_net_inflow_total) }}
+                                </span>
+                                <el-tag :type="fundFlow.summary.retail_flow_trend === '流入' ? 'danger' : 'success'" size="small" style="margin-left: 8px;">
+                                    {{ fundFlow.summary.retail_flow_trend }}
+                                </el-tag>
+                            </el-descriptions-item>
+                            <el-descriptions-item label="背离判断" :span="2">
+                                <el-tag :type="getDivergenceType(fundFlow.summary.divergence)" size="small">
+                                    {{ fundFlow.summary.divergence }}
+                                </el-tag>
+                            </el-descriptions-item>
+                        </el-descriptions>
+                        <!-- 资金流向趋势图 -->
+                        <div id="fundFlowChart" style="width: 100%; height: 250px;"></div>
+                    </div>
+                </div>
+            </el-card>
+        </el-col>
+
+        <!-- 股东数据 -->
+        <el-col :span="12">
+            <el-card shadow="never" style="height: 100%;">
+                <template #header>
+                    <h5 style="margin: 0;">
+                        <el-icon><User /></el-icon>
+                        <span style="margin-left: 8px;">股东数据</span>
+                    </h5>
+                </template>
+                <div v-loading="holderLoading">
+                    <el-empty v-if="!holderData" description="暂无股东数据"></el-empty>
+                    <div v-else>
+                        <el-descriptions :column="2" border size="small" style="margin-bottom: 16px;">
+                            <el-descriptions-item label="股东人数">
+                                <span style="font-weight: bold;">{{ holderData.total_holders?.toLocaleString() || '-' }}</span>
+                                <span v-if="holderData.holder_change" :style="{ color: holderData.holder_change < 0 ? '#67C23A' : '#F56C6C', marginLeft: '8px' }">
+                                    {{ holderData.holder_change > 0 ? '+' : '' }}{{ holderData.holder_change?.toLocaleString() }}
+                                    ({{ holderData.holder_change_pct > 0 ? '+' : '' }}{{ holderData.holder_change_pct?.toFixed(2) }}%)
+                                </span>
+                            </el-descriptions-item>
+                            <el-descriptions-item label="集中度趋势">
+                                <el-tag :type="getConcentrationType(holderData.concentration_trend)" size="small">
+                                    {{ holderData.concentration_trend || '-' }}
+                                </el-tag>
+                            </el-descriptions-item>
+                            <el-descriptions-item label="十大股东持股">
+                                {{ holderData.top10_hold_ratio?.toFixed(2) || '-' }}%
+                            </el-descriptions-item>
+                            <el-descriptions-item label="控股类型">
+                                <el-tag size="small">{{ holderData.control_type || '-' }}</el-tag>
+                            </el-descriptions-item>
+                            <el-descriptions-item label="第一大股东" :span="2">
+                                {{ holderData.first_holder_name || '-' }}
+                                <span v-if="holderData.first_holder_ratio" style="color: #909399; margin-left: 8px;">
+                                    ({{ holderData.first_holder_ratio?.toFixed(2) }}%)
+                                </span>
+                            </el-descriptions-item>
+                        </el-descriptions>
+                        <!-- 前5大股东列表 -->
+                        <div v-if="holderData.top_holders && holderData.top_holders.length > 0">
+                            <div style="font-size: 13px; color: #606266; margin-bottom: 8px;">前5大股东</div>
+                            <el-table :data="holderData.top_holders.slice(0, 5)" size="small" border style="width: 100%;">
+                                <el-table-column label="#" width="40" align="center">
+                                    <template #default="{ row }">
+                                        {{ row.rank || '-' }}
+                                    </template>
+                                </el-table-column>
+                                <el-table-column label="股东名称" show-overflow-tooltip>
+                                    <template #default="{ row }">
+                                        {{ row.name || '-' }}
+                                    </template>
+                                </el-table-column>
+                                <el-table-column label="持股比例" width="80" align="right">
+                                    <template #default="{ row }">
+                                        {{ row.hold_ratio?.toFixed(2) || '-' }}%
+                                    </template>
+                                </el-table-column>
+                            </el-table>
+                        </div>
+                    </div>
+                </div>
+            </el-card>
+        </el-col>
+    </el-row>
+
+    <!-- 行业对比 -->
+    <el-row style="margin-bottom: 20px;">
+        <el-col :span="24">
+            <el-card shadow="never">
+                <template #header>
+                    <h5 style="margin: 0;">
+                        <el-icon><Grid /></el-icon>
+                        <span style="margin-left: 8px;">行业对比</span>
+                        <el-tag v-if="industryRank" size="small" type="info" style="margin-left: 8px;">
+                            {{ industryRank.industry }} ({{ industryRank.total_stocks }}只)
+                        </el-tag>
+                    </h5>
+                </template>
+                <div v-loading="industryRankLoading">
+                    <el-empty v-if="!industryRank" description="暂无行业对比数据"></el-empty>
+                    <el-row v-else :gutter="20">
+                        <!-- 排名指标 -->
+                        <el-col :span="12">
+                            <el-descriptions :column="2" border size="small">
+                                <el-descriptions-item label="涨跌幅排名">
+                                    <span style="font-weight: bold;">{{ industryRank.change_rank }}</span> / {{ industryRank.total_stocks }}
+                                    <el-tag size="small" type="info" style="margin-left: 8px;">
+                                        前{{ industryRank.change_percentile }}%
+                                    </el-tag>
+                                </el-descriptions-item>
+                                <el-descriptions-item label="今日涨跌">
+                                    <span :style="{ color: industryRank.change_pct > 0 ? '#F56C6C' : '#67C23A' }">
+                                        {{ industryRank.change_pct > 0 ? '+' : '' }}{{ industryRank.change_pct?.toFixed(2) }}%
+                                    </span>
+                                </el-descriptions-item>
+                                <el-descriptions-item label="PE排名">
+                                    <span v-if="industryRank.pe_rank">
+                                        <span style="font-weight: bold;">{{ industryRank.pe_rank }}</span>
+                                        <el-tag size="small" :type="industryRank.pe_vs_industry === '低估' ? 'success' : 'danger'" style="margin-left: 8px;">
+                                            {{ industryRank.pe_vs_industry }}
+                                        </el-tag>
+                                    </span>
+                                    <span v-else>-</span>
+                                </el-descriptions-item>
+                                <el-descriptions-item label="PB排名">
+                                    <span v-if="industryRank.pb_rank">
+                                        <span style="font-weight: bold;">{{ industryRank.pb_rank }}</span>
+                                        <el-tag size="small" :type="industryRank.pb_vs_industry === '低估' ? 'success' : 'danger'" style="margin-left: 8px;">
+                                            {{ industryRank.pb_vs_industry }}
+                                        </el-tag>
+                                    </span>
+                                    <span v-else>-</span>
+                                </el-descriptions-item>
+                                <el-descriptions-item label="行业平均PE">
+                                    {{ industryRank.industry_avg_pe?.toFixed(2) || '-' }}
+                                </el-descriptions-item>
+                                <el-descriptions-item label="行业平均涨跌">
+                                    <span :style="{ color: industryRank.industry_avg_change > 0 ? '#F56C6C' : '#67C23A' }">
+                                        {{ industryRank.industry_avg_change > 0 ? '+' : '' }}{{ industryRank.industry_avg_change?.toFixed(2) }}%
+                                    </span>
+                                </el-descriptions-item>
+                            </el-descriptions>
+                        </el-col>
+                        <!-- 行业Top5 -->
+                        <el-col :span="12">
+                            <div style="font-size: 13px; color: #606266; margin-bottom: 8px;">行业涨幅Top 5</div>
+                            <el-table v-if="industryRank.top_stocks" :data="industryRank.top_stocks" size="small" border>
+                                <el-table-column prop="rank" label="#" width="40" />
+                                <el-table-column label="名称" width="100">
+                                    <template #default="{ row }">
+                                        <span :style="{ fontWeight: row.stock_code === stock.stock_code ? 'bold' : 'normal', color: row.stock_code === stock.stock_code ? '#409EFF' : '' }">
+                                            {{ row.stock_name }}
+                                        </span>
+                                    </template>
+                                </el-table-column>
+                                <el-table-column label="涨跌幅" width="80" align="right">
+                                    <template #default="{ row }">
+                                        <span :style="{ color: row.change_pct > 0 ? '#F56C6C' : '#67C23A' }">
+                                            {{ row.change_pct > 0 ? '+' : '' }}{{ row.change_pct?.toFixed(2) }}%
+                                        </span>
+                                    </template>
+                                </el-table-column>
+                                <el-table-column label="PE" width="70" align="right">
+                                    <template #default="{ row }">
+                                        {{ row.pe_ttm?.toFixed(1) || '-' }}
+                                    </template>
+                                </el-table-column>
+                            </el-table>
+                        </el-col>
+                    </el-row>
+                </div>
+            </el-card>
+        </el-col>
+    </el-row>
+
+    <!-- 资讯动态（公告+新闻） -->
+    <el-row style="margin-bottom: 20px;">
+        <el-col :span="24">
+            <el-card shadow="never">
+                <template #header>
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <h5 style="margin: 0;">
+                            <el-icon><Notification /></el-icon>
+                            <span style="margin-left: 8px;">资讯动态</span>
+                        </h5>
+                        <el-tag type="info" size="small">公告 + 新闻</el-tag>
+                    </div>
+                </template>
+                <div
+                    ref="infoFeedContainer"
+                    v-loading="infoFeedLoading && infoFeed.length === 0"
+                    @scroll="handleScroll"
+                    style="max-height: 600px; overflow-y: auto; padding: 10px;"
+                >
+                    <el-empty v-if="infoFeed.length === 0 && !infoFeedLoading" description="暂无资讯"></el-empty>
+                    <ul v-else style="list-style: none; padding: 0; margin: 0;">
+                        <li v-for="(item, index) in infoFeed" :key="index" style="margin-bottom: 16px; padding: 16px; background: #F5F7FA; border-radius: 4px;">
+                            <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
+                                <h4 style="margin: 0; font-size: 14px; color: #303133; flex: 1;">{{ item.title }}</h4>
+                                <div style="display: flex; gap: 4px; margin-left: 12px; flex-shrink: 0;">
+                                    <el-tag
+                                        :type="item.type === 'announcement' ? 'warning' : 'info'"
+                                        size="small"
+                                    >
+                                        {{ item.type === 'announcement' ? '公告' : '新闻' }}
+                                    </el-tag>
+                                    <el-tag
+                                        v-if="item.sentiment"
+                                        :type="getSentimentType(item.sentiment)"
+                                        size="small"
+                                    >
+                                        {{ item.sentiment }}
+                                    </el-tag>
+                                </div>
+                            </div>
+                            <div style="color: #909399; font-size: 12px; margin-bottom: 8px;">
+                                <el-icon><Calendar /></el-icon>
+                                <span style="margin-left: 4px;">{{ item.date_str }}</span>
+                                <span style="margin-left: 12px;">{{ item.category }}</span>
+                            </div>
+                            <p style="margin: 0; line-height: 1.6; color: #606266; font-size: 13px;">{{ item.content }}</p>
+                        </li>
+                    </ul>
+
+                    <!-- 加载更多提示 -->
+                    <div v-if="loadingMore" style="text-align: center; padding: 12px; color: #909399;">
+                        <el-icon class="is-loading"><Loading /></el-icon>
+                        <span style="margin-left: 8px;">加载中...</span>
+                    </div>
+
+                    <!-- 没有更多数据提示 -->
+                    <div v-if="!hasMoreInfoFeed && infoFeed.length > 0" style="text-align: center; padding: 12px; color: #909399; font-size: 12px;">
+                        已加载全部资讯
+                    </div>
+                </div>
+            </el-card>
+        </el-col>
+    </el-row>
+</div>
+{% endraw %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+const { ref, reactive, onMounted } = Vue;
+
+const stockDetailApp = createApp({
+    setup() {
+        // 服务器端数据
+        const stock = reactive({{ stock | tojson }});
+
+        // 响应式数据
+        const klineDays = ref(120);
+        const klineLoading = ref(false);
+        const syncLoading = ref(false);
+        const analyzeLoading = ref(false);
+        const financialLoading = ref(true);
+        const infoFeedLoading = ref(true);
+        const loadingMore = ref(false);
+        const valuationLoading = ref(true);
+        const chipLoading = ref(true);
+        const fundFlowLoading = ref(true);
+        const holderLoading = ref(true);
+        const industryRankLoading = ref(true);
+
+        const financials = ref([]);
+        const infoFeed = ref([]);
+        const infoFeedContainer = ref(null);
+        const valuation = ref(null);
+        const chipData = ref([]);
+        const fundFlow = ref(null);
+        const holderData = ref(null);
+        const industryRank = ref(null);
+
+        // 计算属性 - 最新筹码数据
+        const latestChip = Vue.computed(() => {
+            if (chipData.value && chipData.value.length > 0) {
+                return chipData.value[chipData.value.length - 1];
+            }
+            return {};
+        });
+
+        // 懒加载相关状态
+        let infoFeedOffset = 0;
+        const infoFeedLimit = 20;
+        const hasMoreInfoFeed = ref(true);
+
+        let klineChart = null;
+
+        // 加载K线数据
+        const loadKLineData = async () => {
+            klineLoading.value = true;
+            try {
+                const { data } = await axios.get(`/api/stocks/${stock.stock_code}/klines?days=${klineDays.value}`);
+
+                if (data.success) {
+                    renderKLineChart(data.data);
+                } else {
+                    ElMessage.warning('暂无K线数据');
+                }
+            } catch (error) {
+                console.error('加载K线数据失败:', error);
+                ElMessage.error('加载K线数据失败');
+            } finally {
+                klineLoading.value = false;
+            }
+        };
+
+        // 渲染K线图表
+        const renderKLineChart = (data) => {
+            if (!klineChart) {
+                klineChart = echarts.init(document.getElementById('klineChart'));
+            }
+
+            const option = {
+                tooltip: {
+                    trigger: 'axis',
+                    axisPointer: { type: 'cross' }
+                },
+                legend: {
+                    data: ['K线', 'MA5', 'MA10', 'MA20', 'MA60']
+                },
+                grid: [
+                    { left: '10%', right: '8%', height: '50%' },
+                    { left: '10%', right: '8%', top: '70%', height: '15%' }
+                ],
+                xAxis: [
+                    { type: 'category', data: data.dates, gridIndex: 0 },
+                    { type: 'category', data: data.dates, gridIndex: 1 }
+                ],
+                yAxis: [
+                    { scale: true, gridIndex: 0 },
+                    { scale: true, gridIndex: 1 }
+                ],
+                dataZoom: [
+                    { type: 'inside', xAxisIndex: [0, 1], start: 0, end: 100 },
+                    { show: true, xAxisIndex: [0, 1], type: 'slider', top: '90%', start: 0, end: 100 }
+                ],
+                series: [
+                    {
+                        name: 'K线',
+                        type: 'candlestick',
+                        data: data.values,
+                        itemStyle: {
+                            color: '#ef5350',
+                            color0: '#26a69a',
+                            borderColor: '#ef5350',
+                            borderColor0: '#26a69a'
+                        }
+                    },
+                    { name: 'MA5', type: 'line', data: data.ma5, smooth: true, lineStyle: { width: 1 } },
+                    { name: 'MA10', type: 'line', data: data.ma10, smooth: true, lineStyle: { width: 1 } },
+                    { name: 'MA20', type: 'line', data: data.ma20, smooth: true, lineStyle: { width: 1 } },
+                    { name: 'MA60', type: 'line', data: data.ma60, smooth: true, lineStyle: { width: 1 } },
+                    {
+                        name: '成交量',
+                        type: 'bar',
+                        xAxisIndex: 1,
+                        yAxisIndex: 1,
+                        data: data.volumes
+                    }
+                ]
+            };
+
+            klineChart.setOption(option);
+        };
+
+        // 触发AI分析
+        const handleAnalyze = async () => {
+            try {
+                await ElMessageBox.confirm(
+                    '确定要对该股票进行AI分析吗？分析结果可在"分析报告"页面查看。',
+                    '确认分析',
+                    { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' }
+                );
+
+                analyzeLoading.value = true;
+                const { data } = await axios.post(`/api/stocks/${stock.stock_code}/analyze`);
+
+                if (data.success) {
+                    ElMessage.success('分析成功！请前往"分析报告"页面查看结果。');
+                } else {
+                    ElMessage.error('分析失败: ' + data.message);
+                }
+            } catch (error) {
+                if (error !== 'cancel') {
+                    console.error('分析失败:', error);
+                    ElMessage.error('分析失败');
+                }
+            } finally {
+                analyzeLoading.value = false;
+            }
+        };
+
+        // 同步数据
+        const handleSyncData = async () => {
+            try {
+                await ElMessageBox.confirm(
+                    '确定要同步该股票的数据吗？',
+                    '确认同步',
+                    { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' }
+                );
+
+                syncLoading.value = true;
+                const { data } = await axios.post(`/api/stocks/${stock.stock_code}/sync`);
+
+                if (data.success) {
+                    ElMessage.success('数据同步成功！');
+                    loadKLineData();
+                    loadFinancials();
+                    loadInfoFeed();
+                } else {
+                    ElMessage.error('同步失败: ' + data.message);
+                }
+            } catch (error) {
+                if (error !== 'cancel') {
+                    console.error('同步失败:', error);
+                    ElMessage.error('同步失败');
+                }
+            } finally {
+                syncLoading.value = false;
+            }
+        };
+
+        // 加载财务数据
+        const loadFinancials = async () => {
+            financialLoading.value = true;
+            try {
+                const { data } = await axios.get(`/api/stocks/${stock.stock_code}/financials`);
+                if (data.success) {
+                    financials.value = data.data;
+                    // 渲染财务图表
+                    setTimeout(() => {
+                        renderFinancialCharts();
+                    }, 100);
+                }
+            } catch (error) {
+                console.error('加载财务数据失败:', error);
+            } finally {
+                financialLoading.value = false;
+            }
+        };
+
+        // 渲染财务图表
+        const renderFinancialCharts = () => {
+            if (financials.value.length === 0) return;
+
+            // 准备数据
+            const dates = financials.value.map(f => f.report_date).reverse();
+            const revenues = financials.value.map(f => parseFloat(f.revenue) || 0).reverse();
+            const netProfits = financials.value.map(f => parseFloat(f.net_profit) || 0).reverse();
+            const eps = financials.value.map(f => parseFloat(f.eps) || 0).reverse();
+            const roe = financials.value.map(f => parseFloat(f.roe) || 0).reverse();
+            const debtRatio = financials.value.map(f => parseFloat(f.debt_ratio) || 0).reverse();
+
+            // 营收和净利润图表
+            const revenueChart = echarts.init(document.getElementById('revenueChart'));
+            revenueChart.setOption({
+                title: {
+                    text: '营业收入与净利润趋势',
+                    left: 'center',
+                    textStyle: { fontSize: 14 }
+                },
+                tooltip: {
+                    trigger: 'axis',
+                    axisPointer: { type: 'shadow' }
+                },
+                legend: {
+                    data: ['营业收入', '净利润'],
+                    top: 30
+                },
+                grid: {
+                    left: '3%',
+                    right: '4%',
+                    bottom: '3%',
+                    top: 70,
+                    containLabel: true
+                },
+                xAxis: {
+                    type: 'category',
+                    data: dates,
+                    axisLabel: { rotate: 45 }
+                },
+                yAxis: {
+                    type: 'value',
+                    name: '万元',
+                    axisLabel: {
+                        formatter: (value) => {
+                            if (value >= 10000) return (value / 10000).toFixed(1) + '亿';
+                            return value.toFixed(0);
+                        }
+                    }
+                },
+                series: [
+                    {
+                        name: '营业收入',
+                        type: 'bar',
+                        data: revenues,
+                        itemStyle: { color: '#5470c6' }
+                    },
+                    {
+                        name: '净利润',
+                        type: 'bar',
+                        data: netProfits,
+                        itemStyle: { color: '#91cc75' }
+                    }
+                ]
+            });
+
+            // 财务指标图表
+            const indicatorsChart = echarts.init(document.getElementById('financialIndicatorsChart'));
+            indicatorsChart.setOption({
+                title: {
+                    text: '财务指标趋势',
+                    left: 'center',
+                    textStyle: { fontSize: 14 }
+                },
+                tooltip: {
+                    trigger: 'axis'
+                },
+                legend: {
+                    data: ['每股收益(EPS)', 'ROE(%)', '资产负债率(%)'],
+                    top: 30
+                },
+                grid: {
+                    left: '3%',
+                    right: '4%',
+                    bottom: '3%',
+                    top: 70,
+                    containLabel: true
+                },
+                xAxis: {
+                    type: 'category',
+                    data: dates,
+                    axisLabel: { rotate: 45 }
+                },
+                yAxis: [
+                    {
+                        type: 'value',
+                        name: 'EPS',
+                        position: 'left'
+                    },
+                    {
+                        type: 'value',
+                        name: '百分比(%)',
+                        position: 'right'
+                    }
+                ],
+                series: [
+                    {
+                        name: '每股收益(EPS)',
+                        type: 'line',
+                        data: eps,
+                        yAxisIndex: 0,
+                        smooth: true,
+                        itemStyle: { color: '#fac858' }
+                    },
+                    {
+                        name: 'ROE(%)',
+                        type: 'line',
+                        data: roe,
+                        yAxisIndex: 1,
+                        smooth: true,
+                        itemStyle: { color: '#ee6666' }
+                    },
+                    {
+                        name: '资产负债率(%)',
+                        type: 'line',
+                        data: debtRatio,
+                        yAxisIndex: 1,
+                        smooth: true,
+                        itemStyle: { color: '#73c0de' }
+                    }
+                ]
+            });
+
+            // 响应式
+            window.addEventListener('resize', () => {
+                revenueChart.resize();
+                indicatorsChart.resize();
+            });
+        };
+
+        // 加载估值指标数据
+        const loadValuation = async () => {
+            valuationLoading.value = true;
+            try {
+                const { data } = await axios.get(`/api/stocks/${stock.stock_code}/valuation`);
+                if (data.success) {
+                    valuation.value = data.data;
+                    setTimeout(() => {
+                        renderValuationChart();
+                    }, 100);
+                }
+            } catch (error) {
+                console.error('加载估值数据失败:', error);
+            } finally {
+                valuationLoading.value = false;
+            }
+        };
+
+        // 渲染估值趋势图
+        const renderValuationChart = () => {
+            if (!valuation.value || !valuation.value.history || valuation.value.history.length === 0) return;
+
+            const chart = echarts.init(document.getElementById('valuationChart'));
+            const history = valuation.value.history;
+
+            const dates = history.map(v => v.date);
+            const peData = history.map(v => v.pe_ttm);
+            const pbData = history.map(v => v.pb);
+
+            chart.setOption({
+                tooltip: {
+                    trigger: 'axis'
+                },
+                legend: {
+                    data: ['PE(TTM)', 'PB'],
+                    top: 0
+                },
+                grid: {
+                    left: '3%',
+                    right: '4%',
+                    bottom: '3%',
+                    top: 40,
+                    containLabel: true
+                },
+                xAxis: {
+                    type: 'category',
+                    data: dates,
+                    axisLabel: { rotate: 45, fontSize: 10 }
+                },
+                yAxis: [
+                    {
+                        type: 'value',
+                        name: 'PE',
+                        position: 'left'
+                    },
+                    {
+                        type: 'value',
+                        name: 'PB',
+                        position: 'right'
+                    }
+                ],
+                series: [
+                    {
+                        name: 'PE(TTM)',
+                        type: 'line',
+                        data: peData,
+                        yAxisIndex: 0,
+                        smooth: true,
+                        itemStyle: { color: '#409EFF' }
+                    },
+                    {
+                        name: 'PB',
+                        type: 'line',
+                        data: pbData,
+                        yAxisIndex: 1,
+                        smooth: true,
+                        itemStyle: { color: '#67C23A' }
+                    }
+                ]
+            });
+
+            window.addEventListener('resize', () => chart.resize());
+        };
+
+        // 加载筹码分布数据
+        const loadChipData = async () => {
+            chipLoading.value = true;
+            try {
+                const { data } = await axios.get(`/api/stocks/${stock.stock_code}/chip-distribution`);
+                if (data.success) {
+                    chipData.value = data.data;
+                    setTimeout(() => {
+                        renderChipChart();
+                    }, 100);
+                }
+            } catch (error) {
+                console.error('加载筹码数据失败:', error);
+            } finally {
+                chipLoading.value = false;
+            }
+        };
+
+        // 渲染筹码趋势图
+        const renderChipChart = () => {
+            if (!chipData.value || chipData.value.length === 0) return;
+
+            const chart = echarts.init(document.getElementById('chipChart'));
+            const data = chipData.value;
+
+            const dates = data.map(c => c.date);
+            const profitRatioData = data.map(c => c.profit_ratio);
+            const avgCostData = data.map(c => c.avg_cost);
+            const concentration90Data = data.map(c => c.concentration_90);
+
+            chart.setOption({
+                tooltip: {
+                    trigger: 'axis'
+                },
+                legend: {
+                    data: ['获利比例(%)', '平均成本', '90%集中度(%)'],
+                    top: 0
+                },
+                grid: {
+                    left: '3%',
+                    right: '4%',
+                    bottom: '3%',
+                    top: 40,
+                    containLabel: true
+                },
+                xAxis: {
+                    type: 'category',
+                    data: dates,
+                    axisLabel: { rotate: 45, fontSize: 10 }
+                },
+                yAxis: [
+                    {
+                        type: 'value',
+                        name: '比例(%)',
+                        position: 'left'
+                    },
+                    {
+                        type: 'value',
+                        name: '成本(元)',
+                        position: 'right'
+                    }
+                ],
+                series: [
+                    {
+                        name: '获利比例(%)',
+                        type: 'line',
+                        data: profitRatioData,
+                        yAxisIndex: 0,
+                        smooth: true,
+                        itemStyle: { color: '#F56C6C' }
+                    },
+                    {
+                        name: '平均成本',
+                        type: 'line',
+                        data: avgCostData,
+                        yAxisIndex: 1,
+                        smooth: true,
+                        itemStyle: { color: '#E6A23C' }
+                    },
+                    {
+                        name: '90%集中度(%)',
+                        type: 'line',
+                        data: concentration90Data,
+                        yAxisIndex: 0,
+                        smooth: true,
+                        itemStyle: { color: '#909399' }
+                    }
+                ]
+            });
+
+            window.addEventListener('resize', () => chart.resize());
+        };
+
+        // 加载资金流向数据
+        const loadFundFlow = async () => {
+            fundFlowLoading.value = true;
+            try {
+                const { data } = await axios.get(`/api/stocks/${stock.stock_code}/fund-flow`);
+                if (data.success) {
+                    fundFlow.value = data.data;
+                    setTimeout(() => {
+                        renderFundFlowChart();
+                    }, 100);
+                }
+            } catch (error) {
+                console.error('加载资金流向数据失败:', error);
+            } finally {
+                fundFlowLoading.value = false;
+            }
+        };
+
+        // 渲染资金流向趋势图
+        const renderFundFlowChart = () => {
+            if (!fundFlow.value || !fundFlow.value.history || fundFlow.value.history.length === 0) return;
+
+            const chart = echarts.init(document.getElementById('fundFlowChart'));
+            const history = fundFlow.value.history;
+
+            const dates = history.map(f => f.date);
+            const mainInflow = history.map(f => f.main_net_inflow / 10000);  // 转换为万元
+            const smallInflow = history.map(f => f.small_net_inflow / 10000);
+
+            chart.setOption({
+                tooltip: {
+                    trigger: 'axis',
+                    formatter: (params) => {
+                        let result = params[0].name + '<br/>';
+                        params.forEach(p => {
+                            const value = p.value >= 0 ? '+' + p.value.toFixed(2) : p.value.toFixed(2);
+                            result += `${p.marker} ${p.seriesName}: ${value}万<br/>`;
+                        });
+                        return result;
+                    }
+                },
+                legend: {
+                    data: ['主力净流入', '散户净流入'],
+                    top: 0
+                },
+                grid: {
+                    left: '3%',
+                    right: '4%',
+                    bottom: '3%',
+                    top: 40,
+                    containLabel: true
+                },
+                xAxis: {
+                    type: 'category',
+                    data: dates,
+                    axisLabel: { rotate: 45, fontSize: 10 }
+                },
+                yAxis: {
+                    type: 'value',
+                    name: '万元',
+                    axisLabel: {
+                        formatter: (value) => value.toFixed(0)
+                    }
+                },
+                series: [
+                    {
+                        name: '主力净流入',
+                        type: 'bar',
+                        data: mainInflow,
+                        itemStyle: {
+                            color: (params) => params.value >= 0 ? '#F56C6C' : '#67C23A'
+                        }
+                    },
+                    {
+                        name: '散户净流入',
+                        type: 'bar',
+                        data: smallInflow,
+                        itemStyle: {
+                            color: (params) => params.value >= 0 ? '#E6A23C' : '#409EFF'
+                        }
+                    }
+                ]
+            });
+
+            window.addEventListener('resize', () => chart.resize());
+        };
+
+        // 加载股东数据
+        const loadHolderData = async () => {
+            holderLoading.value = true;
+            try {
+                const { data } = await axios.get(`/api/stocks/${stock.stock_code}/holder`);
+                console.log('股东数据API响应:', data);
+                if (data.success && data.data) {
+                    holderData.value = data.data;
+                    console.log('股东数据设置成功:', holderData.value);
+                    console.log('top_holders:', holderData.value.top_holders);
+                } else {
+                    console.warn('股东数据加载失败:', data.message);
+                }
+            } catch (error) {
+                console.error('加载股东数据失败:', error);
+            } finally {
+                holderLoading.value = false;
+            }
+        };
+
+        // 加载行业对比数据
+        const loadIndustryRank = async () => {
+            industryRankLoading.value = true;
+            try {
+                // 先获取估值数据中的行业信息
+                let industry = null;
+                if (valuation.value && valuation.value.current && valuation.value.current.industry) {
+                    industry = valuation.value.current.industry;
+                }
+
+                if (!industry) {
+                    // 如果没有估值数据，尝试单独获取
+                    const valuationRes = await axios.get(`/api/stocks/${stock.stock_code}/valuation`);
+                    if (valuationRes.data.success && valuationRes.data.data?.current?.industry) {
+                        industry = valuationRes.data.data.current.industry;
+                    }
+                }
+
+                if (industry) {
+                    const { data } = await axios.get(`/api/stocks/${stock.stock_code}/industry-rank?industry=${encodeURIComponent(industry)}`);
+                    if (data.success) {
+                        industryRank.value = data.data;
+                    }
+                }
+            } catch (error) {
+                console.error('加载行业对比数据失败:', error);
+            } finally {
+                industryRankLoading.value = false;
+            }
+        };
+
+        // 加载资讯合集（初次加载）
+        const loadInfoFeed = async () => {
+            infoFeedLoading.value = true;
+            infoFeedOffset = 0;
+            infoFeed.value = [];
+
+            try {
+                console.log('开始加载资讯:', stock.stock_code);
+                const { data } = await axios.get(
+                    `/api/stocks/${stock.stock_code}/info-feed?limit=${infoFeedLimit}&offset=${infoFeedOffset}`
+                );
+
+                console.log('资讯API响应:', data);
+
+                if (data.success) {
+                    infoFeed.value = data.data;
+                    hasMoreInfoFeed.value = data.has_more;
+                    infoFeedOffset += data.data.length;
+                    console.log('加载资讯成功，数量:', data.data.length);
+                } else {
+                    console.error('资讯加载失败:', data.message);
+                }
+            } catch (error) {
+                console.error('加载资讯失败:', error);
+                ElMessage.error('加载资讯失败: ' + error.message);
+            } finally {
+                infoFeedLoading.value = false;
+            }
+        };
+
+        // 加载更多资讯（懒加载）
+        const loadMoreInfoFeed = async () => {
+            if (loadingMore.value || !hasMoreInfoFeed.value) {
+                return;
+            }
+
+            loadingMore.value = true;
+
+            try {
+                const { data } = await axios.get(
+                    `/api/stocks/${stock.stock_code}/info-feed?limit=${infoFeedLimit}&offset=${infoFeedOffset}`
+                );
+
+                if (data.success) {
+                    infoFeed.value.push(...data.data);
+                    hasMoreInfoFeed.value = data.has_more;
+                    infoFeedOffset += data.data.length;
+                }
+            } catch (error) {
+                console.error('加载更多资讯失败:', error);
+            } finally {
+                loadingMore.value = false;
+            }
+        };
+
+        // 滚动事件处理（懒加载触发）
+        const handleScroll = (event) => {
+            const container = event.target;
+            const scrollTop = container.scrollTop;
+            const scrollHeight = container.scrollHeight;
+            const clientHeight = container.clientHeight;
+
+            // 当滚动到距离底部100px时触发加载
+            if (scrollTop + clientHeight >= scrollHeight - 100) {
+                loadMoreInfoFeed();
+            }
+        };
+
+        // 工具函数
+        const formatDateTime = (dateStr) => {
+            if (!dateStr) return '-';
+            const date = new Date(dateStr);
+            return date.toLocaleString('zh-CN');
+        };
+
+        const formatNumber = (num) => {
+            if (!num) return '-';
+            return parseFloat(num).toLocaleString();
+        };
+
+        const getSuggestionType = (suggestion) => {
+            const typeMap = { '买入': 'success', '持有': 'primary', '观望': 'warning', '卖出': 'danger' };
+            return typeMap[suggestion] || 'info';
+        };
+
+        const getRiskType = (riskLevel) => {
+            const typeMap = { '低': 'success', '中': 'warning', '高': 'danger' };
+            return typeMap[riskLevel] || 'info';
+        };
+
+        const getSentimentType = (sentiment) => {
+            const typeMap = { '正面': 'success', '中性': 'info', '负面': 'danger' };
+            return typeMap[sentiment] || 'info';
+        };
+
+        // 估值颜色判断（低于行业为绿色，高于行业为红色）
+        const getValuationColor = (value, industryValue) => {
+            if (!value || !industryValue) return '#606266';
+            return value < industryValue ? '#67C23A' : '#F56C6C';
+        };
+
+        // 格式化市值
+        const formatMarketValue = (value) => {
+            if (!value) return '-';
+            const yi = value / 100000000;
+            if (yi >= 10000) {
+                return (yi / 10000).toFixed(2) + ' 万亿';
+            }
+            return yi.toFixed(2) + ' 亿';
+        };
+
+        // 格式化资金流向
+        const formatFundFlow = (value) => {
+            if (value === null || value === undefined) return '-';
+            const absValue = Math.abs(value);
+            const sign = value >= 0 ? '+' : '-';
+            if (absValue >= 100000000) {
+                return sign + (absValue / 100000000).toFixed(2) + '亿';
+            } else if (absValue >= 10000) {
+                return sign + (absValue / 10000).toFixed(2) + '万';
+            }
+            return sign + absValue.toFixed(2);
+        };
+
+        // 获取背离类型标签样式
+        const getDivergenceType = (divergence) => {
+            if (!divergence) return 'info';
+            if (divergence.includes('看涨')) return 'success';
+            if (divergence.includes('看跌')) return 'danger';
+            return 'info';
+        };
+
+        // 获取集中度趋势标签样式
+        const getConcentrationType = (trend) => {
+            if (!trend) return 'info';
+            if (trend.includes('集中') || trend.includes('减少')) return 'success';
+            if (trend.includes('分散') || trend.includes('增加')) return 'danger';
+            return 'info';
+        };
+
+        const goBack = () => {
+            window.location.href = '/stocks';
+        };
+
+        // 初始化
+        onMounted(() => {
+            loadKLineData();
+            loadFinancials();
+            loadInfoFeed();
+            loadValuation();
+            loadChipData();
+            loadFundFlow();
+            loadHolderData();
+            // 行业对比需要等估值数据加载完成后再调用
+            setTimeout(() => {
+                loadIndustryRank();
+            }, 500);
+
+            // 响应式图表
+            window.addEventListener('resize', () => {
+                if (klineChart) klineChart.resize();
+            });
+        });
+
+        return {
+            stock,
+            klineDays,
+            klineLoading,
+            syncLoading,
+            analyzeLoading,
+            financialLoading,
+            infoFeedLoading,
+            loadingMore,
+            valuationLoading,
+            chipLoading,
+            fundFlowLoading,
+            holderLoading,
+            industryRankLoading,
+            financials,
+            infoFeed,
+            infoFeedContainer,
+            hasMoreInfoFeed,
+            valuation,
+            chipData,
+            latestChip,
+            fundFlow,
+            holderData,
+            industryRank,
+            loadKLineData,
+            handleAnalyze,
+            handleSyncData,
+            handleScroll,
+            formatDateTime,
+            formatNumber,
+            getSentimentType,
+            getValuationColor,
+            formatMarketValue,
+            formatFundFlow,
+            getDivergenceType,
+            getConcentrationType,
+            goBack
+        };
+    }
+});
+
+// 注册 Element Plus
+stockDetailApp.use(ElementPlus, {
+    locale: ElementPlusLocaleZhCn,
+});
+
+// 注册所有图标
+for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+    stockDetailApp.component(key, component);
+}
+
+stockDetailApp.mount('#app');
+</script>
+
+<style scoped>
+[v-cloak] {
+    display: none;
+}
+</style>
+{% endblock %}

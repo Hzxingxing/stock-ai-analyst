@@ -1,0 +1,65 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "启动Web服务",
+      "type": "shell",
+      "command": "source ${workspaceFolder}/.venv/bin/activate && cd ${workspaceFolder}/backend && uvicorn src.web.main:app --reload --port 8000",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "初始化数据库",
+      "type": "shell",
+      "command": "source ${workspaceFolder}/.venv/bin/activate && cd ${workspaceFolder}/backend && python src/database/init_db.py",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "运行测试",
+      "type": "shell",
+      "command": "source ${workspaceFolder}/.venv/bin/activate && cd ${workspaceFolder}/backend && pytest tests/",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "代码格式化",
+      "type": "shell",
+      "command": "source ${workspaceFolder}/.venv/bin/activate && black ${workspaceFolder}/backend/src",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "代码检查",
+      "type": "shell",
+      "command": "source ${workspaceFolder}/.venv/bin/activate && ruff check ${workspaceFolder}/backend/src",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "安装依赖",
+      "type": "shell",
+      "command": "source ${workspaceFolder}/.venv/bin/activate && cd ${workspaceFolder}/backend && uv pip install -r requirements.txt",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    }
+  ]
+}
