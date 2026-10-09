@@ -1,112 +1,87 @@
-# A 股研究助手
+# 研序 · A 股研究工作台
 
-这是一个面向 A 股研究的应用。目标体验是让用户通过简洁、严谨的聊天界面持续讨论股票；后端以受控的数据工具和有状态 Agent 工作流取数、整理证据、记录研究过程，并给出可追溯的结论。
+面向持续股票研究的聊天应用。用户通过对话提出问题，LangGraph Harness 根据任务调用可追溯的数据工具，并保留账户隔离的会话、长期研究记忆与工具执行记录。数据库时间统一按 UTC 存储，市场日期按数据源交易日记录。
 
-## 产品与架构方向
+## 技术架构
 
-- **后端**：Python 3.12、FastAPI、SQLAlchemy、MySQL。保留并逐步整理现有 Python 行情采集和分析能力。
-- **Agent Harness**：以 LangGraph 管理有状态研究工作流，按需使用 LangChain 组件。先由协调器编排具备清晰边界的工具和研究节点；多 Agent 按实际协作需要引入。
-- **前端**：React、TypeScript、Vite，承载新的对话体验；既有 Jinja 页面按迁移计划逐步处理。
-- **缓存**：Redis 用于实时行情、分时和逐笔成交等短期数据；MySQL 保存长期研究数据、会话和审计记录。
-- **研究记忆**：当前轮次上下文、会话摘要、长期用户/研究记忆和市场事实分开管理，并按用户隔离。
+- **前端**：React 19、TypeScript、Vite、Tailwind CSS 4。
+- **API**：Python 3.12、FastAPI、SQLAlchemy 2、MySQL 8。
+- **Harness**：LangGraph 管理有状态研究工作流；从单一协调器和边界明确的研究工具开始。
+- **状态与缓存**：MySQL 保存研究事实、用户会话、记忆、工具轨迹和 LangGraph checkpoints；Redis 短期缓存分时、逐笔及股票目录。
+- **行情源**：AKShare 适配器在可终止的子进程运行，避免供应商请求阻塞 API。
 
-架构质量优先于短期改动量。若完整方案较大，应拆分为边界清楚、可独立验收的阶段；不应只为缩小首轮改动而采用明显次优方案。
+新系统仅使用 `stock_research` 数据库和 `research_mysql_data` Compose volume。旧项目代码、迁移和配置已移除；现有 `stock_analysis` 数据库及其中的旧表和记录不由本系统访问、迁移或修改。
 
-### 数据范围
+## 数据范围
 
-- 个股长期采集限于用户关注的股票；日线、财务、公告、估值、资金流、筹码和股东等研究数据按来源和时间保存。
-- 上证、深证、创业板、科创板及选定的参考指数是系统默认数据，应持续保存指数日线和市场统计，不依赖用户关注列表。
-- 周线、月线优先根据统一复权口径的日线计算。
-- 个股实时行情、分时和逐笔按需通过数据接口获取并短期缓存。逐笔原始记录默认不长期保存，必要时保存有定义的聚合结果。
-- 行情和研究结论应带来源、数据日期、采集时间及单位/口径。财报与公告分析使用实际披露时间，避免历史分析引用当时尚不可得的信息。
-- 对话中需区分外部事实、用户观点和模型推断。长期记忆可查看、修订和删除。
-
-## 当前代码基线
-
-仓库目前仍是旧版 FastAPI/Jinja 应用和数据采集项目，目标中的 React 聊天界面、LangGraph Harness、Redis 缓存、会话管理和长期记忆尚未实现。
-
-当前已有的主要能力：
-
-- `backend/src/web/main.py`：FastAPI Web 应用入口；提供仪表板、股票管理、详情及报告页面。
-- `backend/src/web/routes/api.py`：股票管理、行情及研究数据 API，包括按需同步和单股 AI 分析接口。
-- `backend/src/services/data_sync.py`：将 AKShare 获取的个股行情及部分基本面数据写入数据库。
-- `backend/src/services/gemini_analyzer.py`：通过 OpenAI 兼容接口调用配置的模型并保存分析结果。
-- `backend/stock_analyzer/`：现有行情、技术指标、财务、公告、新闻和相关分析模块。
-- `backend/src/database/models.py`：现有个股行情、筹码摘要、财务、公告、新闻、分析、估值、资金流、股东和市场统计模型。
-- `backend/src/web/templates/`：旧版 Jinja 用户界面。
-
-目前市场统计模型有部分每日广度和成交数据；完整的核心指数历史行情、分钟线与逐笔缓存链路尚未建立。现有筹码数据主要是成本区间等摘要，不是完整的逐价位筹码峰分布。
-
-旧版 `/api/reports/generate` 根据已存 AI 评分生成汇总文本；尽管数据库模型沿用 `ClaudeReport` 名称，该接口不调用 Claude。仓库没有可用的 `backend/main.py` 命令行流程或 `src/scheduler` 定时任务实现。
+- 个股数据仅在用户关注后按需获取；日线和公告、财报、估值、资金流、筹码、股东数据持久保存。
+- 上证、深证成指、创业板、科创 50、沪深 300、中证 500、中证 1000 和上证 50 属于系统级指数，独立于用户关注列表持续同步日线。
+- 周线和月线从同一复权口径的日线聚合。实时行情、分时线和逐笔成交按数据源返回结果短期缓存；逐笔原始记录不写入 MySQL。
+- 财务报告按报告期和披露可用日期保存，避免将尚未披露的数据用于历史时点分析。
+- AKShare 筹码接口提供成本区间与集中度摘要，不提供可还原的逐价筹码柱；系统明确标记完整价位分布不可用，不伪造分布。
+- 工具轨迹保存实际工具、参数摘要、结果摘要、数据来源与日期、缓存状态、耗时和错误；不保存模型隐式推理过程。
 
 ## 本地开发
 
-项目依赖清单目前位于 `backend/requirements.txt`。建议使用 Python 3.12；根目录 `.python-version` 与 `pyproject.toml` 的 Python 版本声明尚未统一，后续开发需一并校准。
+需要 Python 3.12、uv、Node.js 20、npm、MySQL 8 和 Redis。
 
 ```bash
-# 在项目根目录
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -r backend/requirements.txt
 cp backend/.env.example backend/.env
+# 设置 RESEARCH_MYSQL_*、LLM_API_KEY、LLM_BASE_URL、LLM_MODEL，
+# 并将 AUTH_SECRET_KEY 替换为至少 32 位随机值。
+uv sync --all-groups
 ```
 
-编辑 `backend/.env` 配置数据库密码和模型服务：
-
-```dotenv
-MYSQL_PASSWORD=your_mysql_password
-NEWAPI_KEY=your_api_key
-NEWAPI_ENDPOINT=https://your-api-endpoint.example/v1
-```
-
-MySQL 数据库需先运行，数据库名称、用户和主机等配置见 `backend/config/config.yaml`。然后在项目根目录运行：
+在本地开发 MySQL 中创建空的 `stock_research` 数据库，然后创建有该库 DDL/DML 权限的专用用户。不要将旧 `stock_analysis` 作为 `RESEARCH_MYSQL_DATABASE`。从空库建立新 schema：
 
 ```bash
-cd backend
-../.venv/bin/python src/database/init_db.py
-../.venv/bin/uvicorn src.web.main:app --reload --port 8000
+PYTHONPATH=backend uv run alembic -c backend/alembic.ini upgrade head
 ```
 
-访问 `http://localhost:8000`。`/health` 提供健康检查，`/docs` 提供 FastAPI API 文档。
-
-初始化脚本通过 SQLAlchemy `create_all` 创建当前模型中的表并插入示例关注股票；生产环境的结构变更应使用 Alembic 迁移。初始化不会自动抓取历史行情或运行 AI 分析。
-
-### 现有独立分析命令
-
-旧版单股分析工具可以从 `backend` 目录运行：
+启动 API、指数同步任务和前端：
 
 ```bash
-python -m stock_analyzer --code 600519
-python -m stock_analyzer --code 600519 --full --news
+PYTHONPATH=backend uv run uvicorn app.main:app --app-dir backend --reload --port 8000
+PYTHONPATH=backend uv run python -m app.jobs.market_sync
+cd frontend && npm ci && npm run dev
 ```
 
-这与 Web 数据库同步及目标中的 Harness 工作流是不同的入口。
+打开 `http://localhost:5173`，首次使用需注册账户。密码以 Argon2 哈希保存；会话使用 HttpOnly、SameSite Strict Cookie。生产环境需启用安全 Cookie 并设置高熵 `AUTH_SECRET_KEY`。
 
-## 目录结构
+## Docker Compose（本地开发）
+
+Compose 启动独立的新 MySQL volume、Redis、API、市场同步进程和 Vite 前端。它不挂载或连接旧 Compose volume；所有端口绑定到本机 loopback。
+
+```bash
+cp .env.example .env
+cp backend/.env.example backend/.env
+# backend/.env 中填写模型配置和 AUTH_SECRET_KEY。
+# Compose 从根目录 .env 读取 MySQL root 密码，并将同一密码传给仅供本地开发的 API。
+
+docker compose up --build
+```
+
+首次启动后迁移新库：
+
+```bash
+docker compose exec api uv run --project /app alembic -c /app/backend/alembic.ini upgrade head
+```
+
+访问 `http://localhost:5173`；API 文档位于 `http://localhost:8000/docs`。
+
+## 验证
+
+```bash
+PYTHONPATH=backend uv run pytest
+PYTHONPATH=backend uv run ruff check backend/app backend/src/migrations backend/tests
+cd frontend && npm run typecheck && npm run build
+```
+
+## 目录
 
 ```text
-.
-├── AGENTS.md                  # 项目架构、开发流程与协作约定
-├── README.md
-├── setup.sh                   # 旧版 Python 后端依赖安装辅助脚本
-├── docker-compose.yml         # 旧版 Compose 配置，当前需整改后再依赖
-└── backend/
-    ├── config/                # 应用和数据源配置
-    ├── src/
-    │   ├── database/          # ORM、连接、Repository 和初始化
-    │   ├── migrations/        # Alembic 迁移
-    │   ├── services/          # 数据同步、搜索、模型分析
-    │   └── web/               # FastAPI 路由、Jinja 模板和静态文件
-    ├── stock_analyzer/        # 行情采集和传统分析模块
-    └── requirements.txt
+backend/app/                 # API、数据服务、供应商适配器、LangGraph Harness、同步任务
+backend/src/migrations/      # 新系统独立的 Alembic 基线
+frontend/src/                # React 聊天、工具轨迹、关注股票与长期记忆界面
+AGENTS.md                    # 项目架构与协作规范
 ```
-
-## 已知待整理项
-
-- 根目录 `main.py` 和 `pyproject.toml` 仍是模板/占位内容，`backend/requirements.txt` 才是现有后端依赖清单。
-- `.python-version` 与 `pyproject.toml` 声明 Python 3.8，安装脚本和 Dockerfile 使用 Python 3.12；需统一版本来源。
-- `docker-compose.yml` 的 scheduler 服务引用不存在的模块，并包含开发者本机的绝对路径挂载；Compose 部署链路需按目标架构重新设计。
-- 现有测试文件是旧版后端测试；运行前需确认数据库、密钥和外部数据服务配置，测试策略遵从 `AGENTS.md`。
-
-## 开发约定
-
-开始功能或重构前先按根目录 `AGENTS.md` 做只读定位并提交方案；方案确认后再实施。对数据源能力、存储期限和接口限制，不以假设替代验证。

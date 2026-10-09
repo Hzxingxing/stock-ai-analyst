@@ -2,18 +2,20 @@
 Alembic环境配置文件
 负责加载数据库配置和ORM模型
 """
-from logging.config import fileConfig
-from sqlalchemy import engine_from_config, pool
-from alembic import context
+
 import os
 import sys
+from logging.config import fileConfig
 
-# 添加项目根目录到Python路径
+from alembic import context
+from sqlalchemy import engine_from_config, pool
+
+# Make the new backend package importable from an Alembic command run at the repo root.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-# 导入模型和连接配置
-from src.database.models import Base
-from src.database.connection import get_database_url
+# Load only the new research schema. Its baseline is independent of former project migrations.
+from app.config import settings
+from app.db.models import Base
 
 # Alembic Config对象
 config = context.config
@@ -25,9 +27,10 @@ if config.config_file_name is not None:
 # 设置元数据对象（包含所有表定义）
 target_metadata = Base.metadata
 
+
 # 从环境变量或配置文件获取数据库URL
 def get_url():
-    return get_database_url()
+    return settings.sync_database_url
 
 
 def run_migrations_offline() -> None:
@@ -62,6 +65,7 @@ def run_migrations_online() -> None:
         configuration,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={"init_command": "SET time_zone = '+00:00'"},
     )
 
     with connectable.connect() as connection:

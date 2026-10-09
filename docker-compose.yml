@@ -1,76 +1,102 @@
-version: '3.8'
-
 services:
-  mysql:
+  research-mysql:
     image: mysql:8.0
-    container_name: stock-mysql
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: stock_analysis
-      MYSQL_USER: stock_user
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${RESEARCH_MYSQL_ROOT_PASSWORD:-dev-only-root-password}
+      MYSQL_DATABASE: stock_research
       TZ: Asia/Shanghai
     ports:
-      - "3306:3306"
+      - "127.0.0.1:3306:3306"
     volumes:
-      - mysql_data:/var/lib/mysql
-    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
-    networks:
-      - stock-network
+      - research_mysql_data:/var/lib/mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+00:00
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$${MYSQL_ROOT_PASSWORD}\" --silent"]
       interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      ENVIRONMENT: development
+      RESEARCH_MYSQL_HOST: research-mysql
+      RESEARCH_MYSQL_PORT: 3306
+      RESEARCH_MYSQL_DATABASE: stock_research
+      RESEARCH_MYSQL_USER: root
+      RESEARCH_MYSQL_PASSWORD: ${RESEARCH_MYSQL_ROOT_PASSWORD:-dev-only-root-password}
+      REDIS_URL: redis://redis:6379/0
+      AUTH_COOKIE_SECURE: "false"
+      PYTHONPATH: /app/backend
+    env_file:
+      - ./backend/.env
+    depends_on:
+      research-mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: ["uv", "run", "--project", "/app", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 15s
       timeout: 5s
       retries: 5
 
-  web:
-    build: ./backend
-    container_name: stock-web
-    depends_on:
-      mysql:
-        condition: service_healthy
+  market-sync:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     environment:
-      MYSQL_HOST: mysql
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-      NEWAPI_KEY: ${NEWAPI_KEY}
-      NEWAPI_ENDPOINT: ${NEWAPI_ENDPOINT}
-      ENVIRONMENT: production
-      LOG_LEVEL: INFO
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./backend:/app
-      - /Users/asta/PycharmProjects/mywork/stock_analyzer:/app/stock_analyzer:ro
-    command: uvicorn src.web.main:app --host 0.0.0.0 --port 8000 --reload
-    networks:
-      - stock-network
+      ENVIRONMENT: development
+      RESEARCH_MYSQL_HOST: research-mysql
+      RESEARCH_MYSQL_PORT: 3306
+      RESEARCH_MYSQL_DATABASE: stock_research
+      RESEARCH_MYSQL_USER: root
+      RESEARCH_MYSQL_PASSWORD: ${RESEARCH_MYSQL_ROOT_PASSWORD:-dev-only-root-password}
+      PYTHONPATH: /app/backend
+      TZ: Asia/Shanghai
+    env_file:
+      - ./backend/.env
+    depends_on:
+      research-mysql:
+        condition: service_healthy
+    command: ["uv", "run", "--project", "/app", "python", "-m", "app.jobs.market_sync"]
     restart: unless-stopped
 
-  scheduler:
-    build: ./backend
-    container_name: stock-scheduler
-    depends_on:
-      mysql:
-        condition: service_healthy
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
     environment:
-      MYSQL_HOST: mysql
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-      NEWAPI_KEY: ${NEWAPI_KEY}
-      NEWAPI_ENDPOINT: ${NEWAPI_ENDPOINT}
-      ENVIRONMENT: production
-      LOG_LEVEL: INFO
+      VITE_API_TARGET: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:5173:5173"
     volumes:
-      - ./backend:/app
-      - /Users/asta/PycharmProjects/mywork/stock_analyzer:/app/stock_analyzer:ro
-    command: python -m src.scheduler.daily_job
-    networks:
-      - stock-network
-    restart: unless-stopped
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
 
 volumes:
-  mysql_data:
-    driver: local
-
-networks:
-  stock-network:
-    driver: bridge
+  research_mysql_data:
+  frontend_node_modules:

@@ -2,12 +2,12 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python: FastAPI Web服务",
+      "name": "Research API",
       "type": "debugpy",
       "request": "launch",
       "module": "uvicorn",
       "args": [
-        "src.web.main:app",
+        "app.main:app",
         "--reload",
         "--port",
         "8000"
@@ -16,46 +16,15 @@
       "env": {
         "PYTHONPATH": "${workspaceFolder}/backend"
       },
-      "jinja": true,
       "justMyCode": false
     },
     {
-      "name": "Python: 初始化数据库",
+      "name": "Research market sync",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/backend/src/database/init_db.py",
+      "module": "app.jobs.market_sync",
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}/backend",
-      "env": {
-        "PYTHONPATH": "${workspaceFolder}/backend"
-      }
-    },
-    {
-      "name": "Python: 运行主程序",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/backend/main.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}/backend",
-      "args": [
-        "--full"
-      ],
-      "env": {
-        "PYTHONPATH": "${workspaceFolder}/backend"
-      }
-    },
-    {
-      "name": "Python: 测试单只股票",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/backend/main.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}/backend",
-      "args": [
-        "--test",
-        "--code",
-        "600519"
-      ],
       "env": {
         "PYTHONPATH": "${workspaceFolder}/backend"
       }

@@ -1,0 +1,1 @@
+"""Stock research application package."""

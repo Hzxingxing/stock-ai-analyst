@@ -26,6 +26,8 @@ venv/
 ENV/
 env/
 .venv
+node_modules/
+frontend/dist/
 
 # IDE
 .idea/
@@ -70,9 +72,11 @@ htmlcov/
 
 # 数据文件
 data/
+!backend/app/data/
+!backend/app/data/**
+**/__pycache__/
 *.csv
 *.xlsx
-!config/*.yaml
 
 # Docker
 *.pid
