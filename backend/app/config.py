@@ -39,6 +39,9 @@ class Settings(BaseSettings):
         default=SecretStr(""), validation_alias="LLM_API_KEY"
     )
 
+    agent_max_tool_budget: int = Field(default=18, ge=1, validation_alias="AGENT_MAX_TOOL_BUDGET")
+    agent_max_tool_calls: int = Field(default=8, ge=1, validation_alias="AGENT_MAX_TOOL_CALLS")
+
     @model_validator(mode="after")
     def require_deployment_secrets(self) -> "Settings":
         if self.environment.lower() not in {"development", "dev", "test"}:

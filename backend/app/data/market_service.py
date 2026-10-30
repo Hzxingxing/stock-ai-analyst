@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
@@ -46,6 +47,22 @@ CORE_INDEX_PROVIDER_SYMBOLS = {
     "SSE:000016": "sh000016",
 }
 RESEARCH_DATASETS = ("notices", "financial", "valuation", "chip", "fund_flow", "holders")
+_PROVIDER_SEMAPHORE = asyncio.Semaphore(4)
+_TRANSIENT_PROVIDER_ERRORS = (
+    "connectionerror", "connection reset", "remotedisconnected", "readtimeout",
+    "connecttimeout", "timed out", "timeout", "temporarily unavailable",
+)
+
+
+def _market_overview_needs_refresh(row: MarketStatistic | None, now: datetime) -> bool:
+    if row is None or row.collected_at is None or not row.trade_date_source:
+        return True
+    if row.collected_at < now - timedelta(hours=6):
+        return True
+    return (
+        (row.limit_up is None or row.limit_down is None)
+        and row.collected_at < now - timedelta(minutes=15)
+    )
 
 
 def _utc_naive(value: datetime | str) -> datetime:
@@ -66,7 +83,27 @@ def _utc_iso(value: datetime | date | None) -> str | None:
 
 
 class MarketDataError(Exception):
-    pass
+    def __init__(self, message: str, retry_count: int = 0):
+        super().__init__(message)
+        self.retry_count = retry_count
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderOutput:
+    value: Any
+    retry_count: int = 0
+
+
+class InstrumentSearchResults(list[dict[str, str]]):
+    def __init__(
+        self,
+        values: list[dict[str, str]],
+        retry_count: int = 0,
+        provider_error: bool = False,
+    ):
+        super().__init__(values)
+        self.retry_count = retry_count
+        self.provider_error = provider_error
 
 
 class MarketDataService:
@@ -94,37 +131,49 @@ class MarketDataService:
             logger.warning("Redis write failed for key %s", key)
             return False
 
-    async def _run_provider(self, *arguments: str, timeout: int = 30) -> Any:
+    async def _run_provider(self, *arguments: str, timeout: int = 30) -> ProviderOutput:
         environment = os.environ.copy()
         old_pythonpath = environment.get("PYTHONPATH", "")
         environment["PYTHONPATH"] = os.pathsep.join(
             path for path in (str(BACKEND_ROOT), old_pythonpath) if path
         )
-        worker = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "app.data.worker", *arguments,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=environment,
-            limit=8 * 1024 * 1024,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(worker.communicate(), timeout=timeout)
-        except TimeoutError as exc:
-            worker.kill()
-            await worker.communicate()
-            raise MarketDataError("行情源请求超时") from exc
-        except asyncio.CancelledError:
-            worker.kill()
-            await worker.communicate()
-            raise
-        if worker.returncode != 0:
-            details = (stderr or b"").decode("utf-8", errors="replace")
-            logger.warning("AKShare worker failed: %s", details[-2000:])
-            raise MarketDataError("行情源暂时不可用")
-        try:
-            return json.loads(stdout)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise MarketDataError("行情源返回格式异常") from exc
+        async with _PROVIDER_SEMAPHORE:
+            for attempt in range(2):
+                worker = await asyncio.create_subprocess_exec(
+                    sys.executable, "-m", "app.data.worker", *arguments,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=environment,
+                    limit=8 * 1024 * 1024,
+                )
+                try:
+                    stdout, stderr = await asyncio.wait_for(worker.communicate(), timeout=timeout)
+                except TimeoutError as exc:
+                    worker.kill()
+                    await worker.communicate()
+                    if attempt == 0:
+                        await asyncio.sleep(0.35)
+                        continue
+                    raise MarketDataError("行情源请求超时", retry_count=attempt) from exc
+                except asyncio.CancelledError:
+                    worker.kill()
+                    await worker.communicate()
+                    raise
+                if worker.returncode != 0:
+                    details = (stderr or b"").decode("utf-8", errors="replace")
+                    logger.warning("AKShare worker failed: %s", details[-2000:])
+                    transient = any(
+                        marker in details.casefold() for marker in _TRANSIENT_PROVIDER_ERRORS
+                    )
+                    if attempt == 0 and transient:
+                        await asyncio.sleep(0.35)
+                        continue
+                    raise MarketDataError("行情源暂时不可用", retry_count=attempt)
+                try:
+                    return ProviderOutput(json.loads(stdout), retry_count=attempt)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise MarketDataError("行情源返回格式异常", retry_count=attempt) from exc
+        raise MarketDataError("行情源暂时不可用", retry_count=1)
 
     async def _resolve_instrument(
         self, session: AsyncSession, symbol: str, owner_id: str
@@ -170,28 +219,32 @@ class MarketDataService:
         instrument: Instrument,
         adjustment: str,
         lookback_days: int,
-    ) -> int:
+    ) -> tuple[int, int]:
         end_date = datetime.now(MARKET_TIMEZONE).date()
         start_date = end_date - timedelta(days=lookback_days)
         if instrument.instrument_type == "index":
-            records = await self._run_provider(
+            provider = await self._run_provider(
                 "index-daily", instrument.provider_symbol,
                 start_date.isoformat(), end_date.isoformat(), timeout=35,
             )
+            payload = provider.value
             adjustment = "none"
         else:
-            records = await self._run_provider(
+            provider = await self._run_provider(
                 "daily", instrument.provider_symbol, instrument.instrument_type,
                 start_date.isoformat(), end_date.isoformat(), adjustment, timeout=35,
             )
+            payload = provider.value
+        records = payload.get("records", [])
         if not records:
-            return 0
+            raise MarketDataError("行情源未返回有效日线记录", retry_count=provider.retry_count)
+        source = payload["source"]
         values = [
             {
                 **record,
                 "instrument_code": instrument.code,
                 "adjustment": adjustment,
-                "source": "AKShare",
+                "source": source,
             }
             for record in records
         ]
@@ -210,7 +263,7 @@ class MarketDataService:
         )
         await session.execute(statement)
         await session.flush()
-        return len(values)
+        return len(values), provider.retry_count
 
     async def get_price_history(
         self, owner_id: str, symbol: str, period: str = "daily", limit: int = 60,
@@ -241,12 +294,26 @@ class MarketDataService:
             age_days = (datetime.now(MARKET_TIMEZONE).date() - latest).days if latest else None
             fresh = latest is not None and age_days is not None and age_days <= 5
             cache_status = "database"
+            retry_count = 0
+            refresh_warning = None
             if available < requested_daily or not fresh:
-                fetched = await self._fetch_and_store_daily(
-                    session, instrument, effective_adjustment, min(3650, requested_daily * 2)
-                )
-                await session.commit()
-                cache_status = "database_refreshed" if fetched else "database_fresh"
+                try:
+                    fetched, retry_count = await self._fetch_and_store_daily(
+                        session, instrument, effective_adjustment,
+                        min(3650, requested_daily * 2),
+                    )
+                    await session.commit()
+                    if not fetched:
+                        raise MarketDataError("行情源未返回有效日线记录", retry_count=retry_count)
+                    cache_status = "database_refreshed"
+                except MarketDataError as exc:
+                    retry_count = exc.retry_count
+                    if available == 0:
+                        raise
+                    cache_status = "database_stale"
+                    refresh_warning = (
+                        f"行情源刷新失败，返回数据库已有数据；最近记录日期为 {latest}。"
+                    )
 
             rows = (
                 await session.scalars(
@@ -265,6 +332,25 @@ class MarketDataService:
             records = self._aggregate(records, period)
         records = records[-limit:]
         latest_date = records[-1]["date"] if records else None
+        current_date = datetime.now(MARKET_TIMEZONE).date()
+        last_record_date = date.fromisoformat(latest_date) if latest_date else None
+        data_sources = sorted({
+            record.get("source") for record in records if record.get("source")
+        })
+        source_summary = ", ".join(data_sources) if data_sources else "source not recorded"
+        current_period_incomplete = bool(
+            last_record_date and period != "daily" and (
+                (period == "weekly" and last_record_date.isocalendar()[:2]
+                 == current_date.isocalendar()[:2])
+                or (period == "monthly" and last_record_date.strftime("%Y-%m")
+                    == current_date.strftime("%Y-%m"))
+            )
+        )
+        warnings = [refresh_warning] if refresh_warning else []
+        if current_period_incomplete:
+            warnings.append(
+                f"当前{('周线' if period == 'weekly' else '月线')}尚未结束，最新周期仅为阶段数据。"
+            )
         return {
             "symbol": instrument.provider_symbol,
             "name": instrument.name,
@@ -273,14 +359,24 @@ class MarketDataService:
             "adjustment": effective_adjustment,
             "unit": {
                 "price": "index point" if instrument.instrument_type == "index" else "CNY/share",
-                "volume": "lot (as reported by AKShare)",
-                "amount": "CNY",
+                "volume": "lot (100 shares)",
+                "amount": (
+                    "CNY when provided; Sina index data has no amount field"
+                    if instrument.instrument_type == "index"
+                    else "CNY"
+                ),
                 "change_pct": "%",
-                "turnover_rate": "%",
+                "turnover_rate": (
+                    "% (sum of daily rates; approximate period turnover)"
+                    if period != "daily" else "%"
+                ),
             },
-            "source": "AKShare + MySQL",
+            "source": f"MySQL market bars: {source_summary}",
             "data_as_of": latest_date,
             "cache_status": cache_status,
+            "retry_count": retry_count,
+            "warning": "；".join(warnings) or None,
+            "current_period_may_be_incomplete": current_period_incomplete,
             "bars": records,
         }
 
@@ -290,7 +386,7 @@ class MarketDataService:
             "date": bar.trade_date.isoformat(), "open": bar.open, "high": bar.high,
             "low": bar.low, "close": bar.close, "volume": bar.volume,
             "amount": bar.amount, "change_pct": bar.change_pct,
-            "turnover_rate": bar.turnover_rate,
+            "turnover_rate": bar.turnover_rate, "source": bar.source,
         }
 
     @staticmethod
@@ -317,16 +413,25 @@ class MarketDataService:
                 if close is not None and previous_close not in (None, 0)
                 else None
             )
+            sources = sorted({row.get("source") for row in rows if row.get("source")})
+
+            def sum_available(field: str, current_rows=rows) -> float | None:
+                values = [
+                    row[field] for row in current_rows if row.get(field) is not None
+                ]
+                return sum(values) if values else None
+
             aggregated.append({
                 "date": rows[-1]["date"],
                 "open": opens[0] if opens else None,
                 "high": max(highs) if highs else None,
                 "low": min(lows) if lows else None,
                 "close": close,
-                "volume": sum(row["volume"] or 0 for row in rows),
-                "amount": sum(row["amount"] or 0 for row in rows),
+                "volume": sum_available("volume"),
+                "amount": sum_available("amount"),
                 "change_pct": change_pct,
-                "turnover_rate": sum(row["turnover_rate"] or 0 for row in rows),
+                "turnover_rate": sum_available("turnover_rate"),
+                "source": ", ".join(sources) if sources else None,
             })
             previous_close = close
         return aggregated
@@ -346,14 +451,18 @@ class MarketDataService:
         key = f"market:intraday:{code}:{period}"
         points = await self._cache_get(key)
         cache_status = "hit"
+        retry_count = 0
         if points is None:
-            points = await self._run_provider("minute", code, period, timeout=35)
+            provider = await self._run_provider("minute", code, period, timeout=35)
+            points = provider.value
+            retry_count = provider.retry_count
             ttl = {"1": 15, "5": 30, "15": 60, "30": 120, "60": 180}[period]
             cached = await self._cache_set(key, points, ttl)
             cache_status = "miss_cached" if cached else "miss"
         return {
             "symbol": code, "name": name, "period_minutes": int(period),
             "source": "AKShare", "cache_status": cache_status,
+            "retry_count": retry_count,
             "data_as_of": points[-1].get("time") if points else None,
             "bars": points[-max(1, min(limit, 2000)):],
         }
@@ -368,25 +477,76 @@ class MarketDataService:
         key = f"market:trades:{code}"
         trades = await self._cache_get(key)
         cache_status = "hit"
+        retry_count = 0
         if trades is None:
             try:
-                trades = await self._run_provider("ticks", code, timeout=15)
+                provider = await self._run_provider("ticks", code, timeout=15)
+                trades = provider.value
+                retry_count = provider.retry_count
             except MarketDataError as exc:
-                raise MarketDataError(f"逐笔数据源不可用，未保存原始成交记录：{exc}") from exc
+                raise MarketDataError(
+                    f"逐笔数据源不可用，未保存原始成交记录：{exc}",
+                    retry_count=exc.retry_count,
+                ) from exc
             cached = await self._cache_set(key, trades, 10)
             cache_status = "miss_cached" if cached else "miss"
         return {
             "symbol": code, "name": name, "source": "AKShare",
             "cache_status": cache_status,
+            "retry_count": retry_count,
             "retrieved_at": datetime.now(UTC).isoformat(timespec="seconds"),
             "storage_policy": "Redis only; raw trades are not stored in MySQL",
             "trades": trades,
         }
 
+    async def get_current_quote(self, owner_id: str, symbol: str) -> dict[str, Any]:
+        async with self.session_factory() as session:
+            instrument = await self._resolve_instrument(session, symbol, owner_id)
+            code = instrument.provider_symbol
+            name = instrument.name
+        key = f"market:quote:{code.casefold()}"
+        cached = await self._cache_get(key)
+        if cached is not None:
+            return {**cached, "cache_status": "hit", "retry_count": 0}
+        try:
+            provider = await self._run_provider("quote", code, timeout=20)
+        except MarketDataError as exc:
+            try:
+                history = await self.get_price_history(owner_id, symbol, "daily", 1)
+            except MarketDataError as history_error:
+                raise MarketDataError(
+                    f"实时报价不可用，且无法读取最近收盘数据：{history_error}",
+                    retry_count=exc.retry_count + history_error.retry_count,
+                ) from history_error
+            last_bar = history["bars"][-1] if history["bars"] else None
+            if last_bar is None:
+                raise
+            return {
+                "symbol": code, "name": name,
+                "quote": {"price": last_bar["close"], "change_pct": last_bar["change_pct"]},
+                "source": history["source"], "data_as_of": history["data_as_of"],
+                "observed_at": None, "market_time": None,
+                "units": history["unit"], "cache_status": "database_stale",
+                "retry_count": exc.retry_count + history.get("retry_count", 0),
+                "warning": "；".join(filter(None, [
+                    "实时报价源不可用，以下是最近一个交易日收盘数据，不代表当前价格。",
+                    history.get("warning"),
+                ])),
+            }
+        result = {
+            **provider.value,
+            "name": name,
+            "cache_status": "miss_cached" if await self._cache_set(
+                key, {**provider.value, "name": name}, 10
+            ) else "miss",
+            "retry_count": provider.retry_count,
+        }
+        return result
+
     async def search_instruments(self, query: str) -> list[dict[str, str]]:
         query = query.strip()
         if not query:
-            return []
+            return InstrumentSearchResults([])
         async with self.session_factory() as session:
             rows = (
                 await session.scalars(
@@ -396,28 +556,24 @@ class MarketDataService:
                         (Instrument.code.ilike(f"%{query}%"))
                         | Instrument.name.ilike(f"%{query}%"),
                     )
-                )
-            ).all()
-        results = [self._instrument_dict(row) for row in rows]
-        if query.isdigit() and len(query) == 6:
-            exchange = (
-                "SSE" if query.startswith(("6", "9"))
-                else "BSE" if query.startswith(("4", "8"))
-                else "SZSE"
             )
-            results.append({
-                "code": f"{exchange}:{query}", "name": query,
-                "instrument_type": "equity", "provider_symbol": query,
-            })
+        ).all()
+        results = [self._instrument_dict(row) for row in rows]
         cache_key = f"market:equity-search:{query.casefold()[:80]}"
         equities = await self._cache_get(cache_key)
+        retry_count = 0
+        provider_error = False
         if equities is None:
             try:
-                equities = await self._run_provider("search", query, timeout=25)
+                provider = await self._run_provider("search", query, timeout=25)
+                equities = provider.value
+                retry_count = provider.retry_count
                 await self._cache_set(cache_key, equities, 1800)
             except MarketDataError as exc:
                 logger.info("AKShare stock directory search failed (%s)", type(exc).__name__)
                 equities = []
+                retry_count = exc.retry_count
+                provider_error = True
         for item in equities:
             code = item["provider_symbol"]
             exchange = (
@@ -442,7 +598,7 @@ class MarketDataService:
                             exchange=exchange, provider_symbol=item["provider_symbol"],
                         ))
                 await session.commit()
-        return output
+        return InstrumentSearchResults(output, retry_count, provider_error)
 
     @staticmethod
     def _instrument_dict(item: Instrument) -> dict[str, str]:
@@ -461,7 +617,8 @@ class MarketDataService:
             ).all()
             for instrument in instruments:
                 try:
-                    updated += await self._fetch_and_store_index_daily(session, instrument, 30)
+                    count, _ = await self._fetch_and_store_index_daily(session, instrument, 30)
+                    updated += count
                 except MarketDataError:
                     logger.exception("Failed to refresh core index %s", instrument.code)
             await session.commit()
@@ -469,19 +626,21 @@ class MarketDataService:
 
     async def _fetch_and_store_index_daily(
         self, session: AsyncSession, instrument: Instrument, lookback_days: int
-    ) -> int:
+    ) -> tuple[int, int]:
         end_date = datetime.now(MARKET_TIMEZONE).date()
         start_date = end_date - timedelta(days=lookback_days)
-        records = await self._run_provider(
+        provider = await self._run_provider(
             "index-daily", instrument.provider_symbol,
             start_date.isoformat(), end_date.isoformat(), timeout=35,
         )
+        payload = provider.value
+        records = payload.get("records", [])
         if not records:
-            return 0
+            raise MarketDataError("指数行情源未返回有效日线记录", retry_count=provider.retry_count)
         statement = mysql_insert(MarketDailyBar).values([
             {
                 **record, "instrument_code": instrument.code,
-                "adjustment": "none", "source": "AKShare",
+                "adjustment": "none", "source": payload["source"],
             }
             for record in records
         ])
@@ -493,12 +652,13 @@ class MarketDataService:
             volume=statement.inserted.volume,
             amount=statement.inserted.amount,
             change_pct=statement.inserted.change_pct,
+            turnover_rate=statement.inserted.turnover_rate,
             source=statement.inserted.source,
             collected_at=func.now(),
         )
         await session.execute(statement)
         await session.flush()
-        return len(records)
+        return len(records), provider.retry_count
 
     async def get_company_research(
         self, owner_id: str, symbol: str, dataset: str, limit: int = 20
@@ -520,30 +680,57 @@ class MarketDataService:
             cached = await self._read_company_dataset(session, instrument, dataset, limit)
             if fresh:
                 cached = cached or {"records": [], "data_as_of": None, "units": {}}
-                return {
+                return self._research_result({
                     "symbol": provider_symbol, "name": name, "dataset": dataset,
                     "source": state.source, "data_as_of": cached["data_as_of"],
                     "cache_status": "database", "records": cached["records"],
                     "units": cached.get("units", {}),
                     "distribution_available": cached.get("distribution_available"),
-                }
+                }, dataset)
 
-        payload = await self._run_provider(
-            "company-research", provider_symbol, dataset, timeout=90
-        )
-        written = await self._store_company_dataset(code, dataset, payload)
+        try:
+            provider = await self._run_provider(
+                "company-research", provider_symbol, dataset, timeout=90
+            )
+        except MarketDataError as exc:
+            if cached is None:
+                raise
+            return self._research_result({
+                "symbol": provider_symbol, "name": name, "dataset": dataset,
+                "source": cached.get("source", "database"),
+                "data_as_of": cached.get("data_as_of"),
+                "cache_status": "database_stale",
+                "records": cached.get("records", []),
+                "units": cached.get("units", {}),
+                "distribution_available": cached.get("distribution_available"),
+                "retry_count": exc.retry_count,
+                "warning": f"数据源刷新失败，返回数据库已有记录：{exc}",
+            }, dataset)
+        written = await self._store_company_dataset(code, dataset, provider.value)
         async with self.session_factory() as session:
             instrument = await session.get(Instrument, code)
             cached = await self._read_company_dataset(session, instrument, dataset, limit)
             if cached is None:
                 cached = {"records": [], "data_as_of": None, "units": {}}
-        return {
+        return self._research_result({
             "symbol": provider_symbol, "name": name, "dataset": dataset,
             "source": cached.get("source", "AKShare"), "data_as_of": cached["data_as_of"],
             "cache_status": "database_refreshed" if written else "database_fresh",
             "records": cached["records"], "units": cached.get("units", {}),
             "distribution_available": cached.get("distribution_available"),
-        }
+            "retry_count": provider.retry_count,
+        }, dataset)
+
+    @staticmethod
+    def _research_result(result: dict[str, Any], dataset: str) -> dict[str, Any]:
+        if dataset == "notices" and any(
+            not item.get("content") for item in result.get("records", [])
+        ):
+            result["warning"] = (
+                (result.get("warning", "") + "；")
+                if result.get("warning") else ""
+            ) + "巨潮公告正文未采集；不能仅凭标题推断公告具体内容。"
+        return result
 
     async def _read_company_dataset(
         self, session: AsyncSession, instrument: Instrument, dataset: str, limit: int
@@ -558,6 +745,8 @@ class MarketDataService:
                 "announcement_date": row.announcement_date.isoformat() if row.announcement_date else None,
                 "disclosure_time": _utc_iso(row.disclosure_time),
                 "category": row.category, "title": row.title, "url": row.url,
+                "content": row.content,
+                "content_status": "available" if row.content else "metadata_only",
             } for row in rows]
             return self._dataset_result(rows, values, lambda row: row.announcement_date, "CNINFO")
         if dataset == "financial":
@@ -684,13 +873,19 @@ class MarketDataService:
                         announcement_date=date.fromisoformat(record["announcement_date"]),
                         disclosure_time=disclosure_time, category=record.get("category"),
                         title=record["title"][:1000], url=record.get("url"),
+                        content=record.get("content"),
                         source=record.get("source", "CNINFO"),
                     )
-                    await session.execute(statement.on_duplicate_key_update(
-                        announcement_date=date.fromisoformat(record["announcement_date"]),
-                        disclosure_time=disclosure_time, title=record["title"][:1000],
-                        url=record.get("url"), collected_at=func.now(),
-                    ))
+                    updates = {
+                        "announcement_date": date.fromisoformat(record["announcement_date"]),
+                        "disclosure_time": disclosure_time,
+                        "title": record["title"][:1000],
+                        "url": record.get("url"),
+                        "collected_at": func.now(),
+                    }
+                    if record.get("content"):
+                        updates["content"] = record["content"]
+                    await session.execute(statement.on_duplicate_key_update(**updates))
                 written = len(payload.get("notices", []))
                 source = "CNINFO"
             elif dataset == "financial":
@@ -798,83 +993,192 @@ class MarketDataService:
                     MarketDailyBar.adjustment == "none",
                 )
             )
+            fallback_date_source = "SSE:000001 stored daily bars"
+            index_refresh_error = None
             if trade_date is None:
                 index = await session.get(Instrument, "SSE:000001")
                 if index is not None:
-                    await self._fetch_and_store_index_daily(session, index, 30)
-                    await session.commit()
-                    trade_date = await session.scalar(
-                        select(func.max(MarketDailyBar.trade_date)).where(
-                            MarketDailyBar.instrument_code == "SSE:000001",
-                            MarketDailyBar.adjustment == "none",
+                    try:
+                        await self._fetch_and_store_index_daily(session, index, 30)
+                        await session.commit()
+                        trade_date = await session.scalar(
+                            select(func.max(MarketDailyBar.trade_date)).where(
+                                MarketDailyBar.instrument_code == "SSE:000001",
+                                MarketDailyBar.adjustment == "none",
+                            )
                         )
-                    )
+                    except MarketDataError as exc:
+                        index_refresh_error = exc
             if trade_date is None:
-                raise MarketDataError("尚无可确认的核心指数交易日，暂时无法生成市场概览")
+                trade_date = await session.scalar(select(func.max(MarketStatistic.trade_date)))
+                fallback_date_source = "latest stored market-statistics date"
+            if trade_date is None:
+                retry_count = getattr(index_refresh_error, "retry_count", 0)
+                raise MarketDataError(
+                    "核心指数和市场统计均无可用交易日，暂时无法生成市场概览",
+                    retry_count=retry_count,
+                )
             row = await session.get(MarketStatistic, trade_date)
         cache_status = "database"
-        is_stale = (
-            row is None
-            or row.collected_at is None
-            or row.collected_at < datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=6)
+        warning = None
+        retry_count = 0
+        is_stale = _market_overview_needs_refresh(
+            row, datetime.now(UTC).replace(tzinfo=None)
         )
         if is_stale:
-            snapshot = await self._run_provider("snapshot", timeout=35)
-            if not snapshot:
-                raise MarketDataError("市场概览数据源没有返回记录")
-            changes = []
-            volumes = []
-            amounts = []
-            for record in snapshot:
-                change = self._snapshot_number(record, "涨跌幅", "涨跌幅(%)", "change_pct")
-                volume = self._snapshot_number(record, "成交量", "volume")
-                amount = self._snapshot_number(record, "成交额", "amount")
-                if change is not None:
-                    changes.append(change)
-                if volume is not None:
-                    volumes.append(volume)
-                if amount is not None:
-                    amounts.append(amount)
-            market_trade_date = self._snapshot_trade_date(snapshot, trade_date)
-            if market_trade_date is None:
-                raise MarketDataError("市场概览缺少可确认的交易日期")
-            values = {
-                "trade_date": market_trade_date,
-                "total_stocks": len(changes),
-                "advances": sum(value > 0 for value in changes),
-                "declines": sum(value < 0 for value in changes),
-                "unchanged": sum(value == 0 for value in changes),
-                "limit_up": None,
-                "limit_down": None,
-                "total_volume": sum(volumes),
-                "total_amount": sum(amounts),
-                "source": "AKShare stock_zh_a_spot_em",
-            }
-            async with self.session_factory() as session:
-                statement = mysql_insert(MarketStatistic).values(**values)
-                statement = statement.on_duplicate_key_update(
-                    **{key: statement.inserted[key] for key in values if key != "trade_date"},
-                    collected_at=func.now(),
+            try:
+                provider = await self._run_provider("snapshot", timeout=35)
+                snapshot_payload = provider.value
+                snapshot = snapshot_payload.get("records", [])
+                if not snapshot:
+                    raise MarketDataError(
+                        "市场概览数据源没有返回记录", retry_count=provider.retry_count
+                    )
+                market_trade_date = self._snapshot_trade_date(snapshot, trade_date)
+                if market_trade_date is None:
+                    raise MarketDataError(
+                        "市场概览缺少可确认的交易日期", retry_count=provider.retry_count
+                    )
+                has_snapshot_date = self._snapshot_has_trade_date(snapshot)
+                trade_date_source = (
+                    "Tencent snapshot date field"
+                    if has_snapshot_date else fallback_date_source
                 )
-                await session.execute(statement)
-                await session.commit()
-                row = await session.get(MarketStatistic, market_trade_date)
-            cache_status = "database_refreshed"
+                limit_statistics = {
+                    "limit_up": None,
+                    "limit_down": None,
+                    "limit_up_source": None,
+                    "limit_down_source": None,
+                }
+                limit_retry_count = 0
+                limit_warning = None
+                try:
+                    limit_provider = await self._run_provider(
+                        "limit-statistics", market_trade_date.isoformat(), timeout=35
+                    )
+                    limit_statistics.update({
+                        field: limit_provider.value.get(field)
+                        for field in limit_statistics
+                    })
+                    limit_retry_count = limit_provider.retry_count
+                    limit_warning = limit_provider.value.get("warning")
+                except MarketDataError as exc:
+                    limit_retry_count = exc.retry_count
+                    limit_warning = "涨跌停统计数据源暂时不可用，相关字段保持为空。"
+
+                values = {
+                    "trade_date": market_trade_date,
+                    "trade_date_source": trade_date_source,
+                    **self._market_snapshot_statistics(snapshot),
+                    **limit_statistics,
+                    "source": snapshot_payload["source"],
+                }
+                async with self.session_factory() as session:
+                    statement = mysql_insert(MarketStatistic).values(**values)
+                    update_values = {
+                        key: statement.inserted[key]
+                        for key in values if key != "trade_date"
+                    }
+                    for field in (
+                        "limit_up", "limit_down", "limit_up_source", "limit_down_source"
+                    ):
+                        if values[field] is None:
+                            update_values[field] = func.coalesce(
+                                statement.inserted[field], getattr(MarketStatistic, field)
+                            )
+                    statement = statement.on_duplicate_key_update(
+                        **update_values,
+                        collected_at=func.now(),
+                    )
+                    await session.execute(statement)
+                    await session.commit()
+                    refreshed_row = await session.get(MarketStatistic, market_trade_date)
+                    if refreshed_row is None:
+                        raise MarketDataError(
+                            "市场概览写入后未能重新读取", retry_count=provider.retry_count
+                        )
+                    row = refreshed_row
+                cache_status = "database_refreshed"
+                retry_count = provider.retry_count + limit_retry_count
+                warning = limit_warning
+            except MarketDataError as exc:
+                if row is None:
+                    raise
+                cache_status = "database_stale"
+                retry_count = exc.retry_count
+                warning = f"市场概览刷新失败，返回数据库已有统计：{exc}"
+        if row is None:
+            raise MarketDataError("市场概览没有可返回的已保存统计", retry_count=retry_count)
+        if row.trade_date_source != "Tencent snapshot date field":
+            date_warning = (
+                "市场快照未提供交易日期，当前使用已保存的交易日依据归档；"
+                "快照所属交易日未能独立确认。"
+                if row.trade_date_source else "该市场统计未记录交易日依据，日期未能独立核实。"
+            )
+            warning = f"{warning}；{date_warning}" if warning else date_warning
+        missing_fields = [
+            key for key in ("limit_up", "limit_down") if getattr(row, key) is None
+        ]
+        if missing_fields:
+            missing_warning = "涨跌停统计缺失：" + "、".join(missing_fields)
+            warning = f"{warning}；{missing_warning}" if warning else missing_warning
         return {
             "trade_date": row.trade_date.isoformat(),
+            "trade_date_source": row.trade_date_source,
             "total_stocks": row.total_stocks,
             "advances": row.advances,
             "declines": row.declines,
             "unchanged": row.unchanged,
             "limit_up": row.limit_up,
             "limit_down": row.limit_down,
+            "limit_up_source": row.limit_up_source,
+            "limit_down_source": row.limit_down_source,
             "total_volume": row.total_volume,
             "total_amount": row.total_amount,
             "source": row.source,
-            "units": {"total_amount": "CNY", "total_volume": "AKShare-reported lots"},
+            "units": {
+                "total_amount": "CNY (Tencent turnover normalized from 10,000 CNY)"
+                if "Tencent" in row.source else "CNY",
+                "total_volume": "lot (100 shares)"
+                if "Tencent" in row.source else "AKShare-reported lots",
+                "limit_up": "stocks",
+                "limit_down": "stocks",
+            },
             "cache_status": cache_status,
+            "retry_count": retry_count,
+            "warning": warning,
             "collected_at": _utc_iso(row.collected_at),
+            "missing_fields": missing_fields,
         }
+
+    @staticmethod
+    def _market_snapshot_statistics(snapshot: list[dict[str, Any]]) -> dict[str, Any]:
+        changes = [
+            value for record in snapshot
+            if (value := MarketDataService._snapshot_number(
+                record, "涨跌幅", "涨跌幅(%)", "change_pct"
+            )) is not None
+        ]
+        volumes = [
+            value for record in snapshot
+            if (value := MarketDataService._snapshot_number(record, "成交量", "volume")) is not None
+        ]
+        amounts = [
+            value for record in snapshot
+            if (value := MarketDataService._snapshot_number(record, "成交额", "amount")) is not None
+        ]
+        return {
+            "total_stocks": len(changes),
+            "advances": sum(value > 0 for value in changes),
+            "declines": sum(value < 0 for value in changes),
+            "unchanged": sum(value == 0 for value in changes),
+            "total_volume": sum(volumes) if len(volumes) == len(snapshot) else None,
+            "total_amount": sum(amounts) if len(amounts) == len(snapshot) else None,
+        }
+
+    @staticmethod
+    def _snapshot_has_trade_date(snapshot: list[dict[str, Any]]) -> bool:
+        return any(record.get("日期") or record.get("date") for record in snapshot)
 
     @staticmethod
     def _snapshot_trade_date(

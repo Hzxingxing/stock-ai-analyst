@@ -10,8 +10,8 @@ export default defineConfig(({ mode }) => {
       host: "0.0.0.0",
       port: 5173,
       proxy: {
-        "/api": env.VITE_API_TARGET || "http://127.0.0.1:8000",
-        "/health": env.VITE_API_TARGET || "http://127.0.0.1:8000",
+        "/api": env.VITE_API_TARGET || "http://127.0.0.1:8800",
+        "/health": env.VITE_API_TARGET || "http://127.0.0.1:8800",
       },
     },
   };

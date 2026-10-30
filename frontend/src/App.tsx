@@ -10,17 +10,38 @@ import {
 } from "lucide-react";
 
 import { api, ApiError } from "./api";
-import type { Conversation, Instrument, MarketOverview, Memory, Message, ToolCall, User } from "./types";
+import type {
+  Conversation, Instrument, MarketOverview, Memory, MemorySuggestion, Message, ToolCall, User,
+} from "./types";
 
 type AuthMode = "login" | "register";
 type RightTab = "watchlist" | "memory";
 
 const toolLabels: Record<string, string> = {
+  search_instruments: "标的检索",
   get_price_history: "查询历史行情",
   get_intraday_bars: "获取分时数据",
   get_recent_trades: "获取逐笔成交",
+  get_current_quote: "读取实时行情",
+  analyze_price_history: "计算行情指标",
+  compare_instruments: "比较标的表现",
   get_market_overview: "读取市场广度",
+  get_company_research_data: "读取公司研究数据",
+  propose_research_memory: "提出记忆建议",
 };
+
+function memoryProposal(call: ToolCall): MemorySuggestion | null {
+  if (call.memory_proposal) return call.memory_proposal;
+  if (!call.output_summary) return null;
+  try {
+    const parsed = JSON.parse(call.output_summary);
+    const proposal = parsed?.memory_proposal;
+    if (proposal && typeof proposal.statement === "string") return proposal as MemorySuggestion;
+  } catch {
+    return null;
+  }
+  return null;
+}
 
 function initials(email: string): string {
   return email.slice(0, 1).toLocaleUpperCase();
@@ -123,16 +144,26 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: User) => void
   );
 }
 
-function ToolTrace({ calls }: { calls: ToolCall[] }) {
+function ToolTrace({
+  calls,
+  onUseMemoryProposal,
+}: {
+  calls: ToolCall[];
+  onUseMemoryProposal: (proposal: MemorySuggestion) => void;
+}) {
   if (!calls.length) return null;
-  const complete = calls.filter((call) => call.status === "complete").length;
+  const running = calls.some((call) => call.status === "running");
+  const failed = calls.some((call) => call.status === "error");
+  const partial = calls.some((call) => call.status === "partial");
   return (
     <details className="trace-panel">
       <summary>
         <span className="trace-summary-icon"><Activity size={14} /></span>
         <span>研究过程</span>
         <span className="trace-count">{calls.length} 项工具调用</span>
-        <span className="trace-status">{complete === calls.length ? "已完成" : "执行中"}</span>
+        <span className={`trace-status${partial && !failed ? " trace-status-warning" : ""}`}>
+          {running ? "执行中" : failed ? "部分失败" : partial ? "结果有缺失" : "已完成"}
+        </span>
         <ChevronDown className="trace-chevron" size={15} />
       </summary>
       <div className="trace-list">
@@ -145,18 +176,35 @@ function ToolTrace({ calls }: { calls: ToolCall[] }) {
                 {call.duration_ms != null && <span>{call.duration_ms.toLocaleString()} ms</span>}
               </div>
               <div className="trace-output">
-                {call.output_summary || (call.status === "running" ? "正在执行数据查询…" : call.error_summary || "工具已执行")}
+                {memoryProposal(call)
+                  ? `记忆建议：${memoryProposal(call)?.statement}`
+                  : call.output_summary || (call.status === "running" ? "正在执行数据查询…" : call.error_summary || "工具已执行")}
               </div>
               <div className="trace-meta">
                 {call.source && <span><Database size={12} /> {call.source}</span>}
                 {call.data_as_of && <span><Clock3 size={12} /> 数据截至 {call.data_as_of}</span>}
-                {call.cache_status && <span>{call.cache_status.includes("hit") ? "缓存命中" : "已刷新"}</span>}
+                {call.cache_status && <span>{({
+                  hit: "短期缓存命中", miss_cached: "实时获取并缓存", miss: "实时获取",
+                  database: "数据库读取", database_refreshed: "数据库已更新",
+                  database_stale: "使用数据库旧数据", database_fresh: "数据库读取",
+                } as Record<string, string>)[call.cache_status] || call.cache_status}</span>}
                 {call.retry_count ? <span>重试 {call.retry_count} 次</span> : null}
               </div>
+              {call.status === "complete" && memoryProposal(call) && (
+                <button className="trace-memory-accept" onClick={() => onUseMemoryProposal(memoryProposal(call)!)}>
+                  审核并保存到长期记忆
+                </button>
+              )}
               {call.input && Object.keys(call.input).length > 0 && (
                 <details className="trace-arguments">
                   <summary>查看参数</summary>
                   <pre>{JSON.stringify(call.input, null, 2)}</pre>
+                </details>
+              )}
+              {call.evidence && (
+                <details className="trace-arguments trace-evidence">
+                  <summary>查看结构化证据</summary>
+                  <pre>{JSON.stringify(call.evidence, null, 2)}</pre>
                 </details>
               )}
             </div>
@@ -169,8 +217,16 @@ function ToolTrace({ calls }: { calls: ToolCall[] }) {
   );
 }
 
-function MessageItem({ message }: { message: Message }) {
+function MessageItem({
+  message,
+  onUseMemoryProposal,
+}: {
+  message: Message;
+  onUseMemoryProposal: (proposal: MemorySuggestion) => void;
+}) {
   const isAssistant = message.role === "assistant";
+  const messageStatus = String(message.metadata?.status || "");
+  const messageError = typeof message.metadata?.error === "string" ? message.metadata.error : "";
   return (
     <article className={`message-row ${isAssistant ? "message-assistant" : "message-user"}`}>
       {isAssistant && <div className="assistant-avatar"><Activity size={16} /></div>}
@@ -184,7 +240,12 @@ function MessageItem({ message }: { message: Message }) {
           {message.streaming && !message.content && <span className="typing-cursor" aria-label="正在生成" />}
           {message.streaming && message.content && <span className="typing-cursor" aria-hidden="true" />}
         </div>
-        {isAssistant && <ToolTrace calls={message.tool_calls || []} />}
+        {isAssistant && (messageStatus === "error" || messageStatus === "interrupted") && (
+          <div className="message-error" role="alert">
+            {messageError || (messageStatus === "interrupted" ? "本轮研究已中断，内容可能不完整。" : "本轮研究未完整完成。")}
+          </div>
+        )}
+        {isAssistant && <ToolTrace calls={message.tool_calls || []} onUseMemoryProposal={onUseMemoryProposal} />}
       </div>
       {!isAssistant && <div className="user-avatar">你</div>}
     </article>
@@ -211,6 +272,11 @@ export default function App() {
   const [searching, setSearching] = useState(false);
   const [memoryDraft, setMemoryDraft] = useState("");
   const [memoryKind, setMemoryKind] = useState<Memory["kind"]>("hypothesis");
+  const [memoryAttribution, setMemoryAttribution] = useState<Memory["attribution"]>("user");
+  const [memoryInstrumentCodes, setMemoryInstrumentCodes] = useState("");
+  const [memoryValidUntil, setMemoryValidUntil] = useState("");
+  const [memorySupersedesId, setMemorySupersedesId] = useState<string | null>(null);
+  const [memorySuggestion, setMemorySuggestion] = useState<MemorySuggestion | null>(null);
   const [memorySaving, setMemorySaving] = useState(false);
   const [overview, setOverview] = useState<MarketOverview | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(false);
@@ -313,7 +379,9 @@ export default function App() {
   }
 
   async function switchConversation(id: string) {
-    abortController.current?.abort();
+    const controller = abortController.current;
+    abortController.current = null;
+    controller?.abort();
     setSending(false);
     setPhase("");
     activeLoad.current += 1;
@@ -381,6 +449,7 @@ export default function App() {
       const decoder = new TextDecoder();
       let buffer = "";
       let currentMessageId = placeholderId;
+      let terminalEventReceived = false;
       const applyEvent = (block: string) => {
         let eventName = "message";
         const dataLines: string[] = [];
@@ -416,20 +485,31 @@ export default function App() {
             return { ...message, tool_calls: nextCalls };
           }));
         } else if (eventName === "done") {
+          terminalEventReceived = true;
           setPhase("");
           setMessages((current) => current.map((message) => message.id === currentMessageId
             ? { ...message, streaming: false }
             : message));
         } else if (eventName === "error") {
+          terminalEventReceived = true;
           setPhase("");
           setMessages((current) => current.map((message) => message.id === currentMessageId
-            ? { ...message, content: message.content || data.message, streaming: false }
+            ? {
+                ...message,
+                content: message.content || data.message,
+                metadata: { ...message.metadata, status: "error", error: data.message },
+                streaming: false,
+              }
             : message));
         }
       };
       while (true) {
         const { value, done } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          buffer = buffer.replace(/\r\n/g, "\n");
+          break;
+        }
         buffer += decoder.decode(value, { stream: true });
         buffer = buffer.replace(/\r\n/g, "\n");
         const blocks = buffer.split("\n\n");
@@ -437,25 +517,48 @@ export default function App() {
         for (const block of blocks) applyEvent(block);
       }
       if (buffer.trim()) applyEvent(buffer);
-      setMessages((current) => current.map((message) => message.id === currentMessageId
-        ? { ...message, streaming: false }
-        : message));
+      if (!terminalEventReceived) {
+        const error = "研究连接提前结束，本轮回答可能不完整。";
+        setMessages((current) => current.map((message) => message.id === currentMessageId
+          ? {
+              ...message,
+              metadata: { ...message.metadata, status: "error", error },
+              streaming: false,
+            }
+          : message));
+      } else {
+        setMessages((current) => current.map((message) => message.id === currentMessageId
+          ? { ...message, streaming: false }
+          : message));
+      }
       void refreshWorkspace();
     } catch (reason) {
       if (reason instanceof DOMException && reason.name === "AbortError") {
         setMessages((current) => current.map((message) => message.id === activeAssistantId
-          ? { ...message, streaming: false, content: message.content || "本轮研究已停止。" }
+          ? {
+              ...message,
+              streaming: false,
+              content: message.content || "本轮研究已停止。",
+              metadata: { ...message.metadata, status: "interrupted", error: "本轮研究已停止，内容可能不完整。" },
+            }
           : message));
       } else {
         const message = reason instanceof Error ? reason.message : "网络连接暂时中断";
-        setMessages((current) => current.map((item) => item.id === placeholderId
-          ? { ...item, streaming: false, content: item.content || message }
+        setMessages((current) => current.map((item) => item.id === activeAssistantId
+          ? {
+              ...item,
+              streaming: false,
+              content: item.content || message,
+              metadata: { ...item.metadata, status: "error", error: message },
+            }
           : item));
       }
     } finally {
-      abortController.current = null;
-      setSending(false);
-      setPhase("");
+      if (abortController.current === controller) {
+        abortController.current = null;
+        setSending(false);
+        setPhase("");
+      }
     }
   }
 
@@ -505,16 +608,67 @@ export default function App() {
     try {
       await api<Memory>("/memories", {
         method: "POST",
-        body: JSON.stringify({ kind: memoryKind, statement: memoryDraft.trim(), attribution: "user" }),
+        body: JSON.stringify({
+          kind: memoryKind,
+          statement: memoryDraft.trim(),
+          attribution: memoryAttribution,
+          stance: memorySuggestion?.stance,
+          supporting_evidence: memorySuggestion?.supporting_evidence || [],
+          counter_evidence: memorySuggestion?.counter_evidence || [],
+          invalidation_conditions: memorySuggestion?.invalidation_conditions || [],
+          instrument_codes: memoryInstrumentCodes.split(/[\s,，;；]+/).filter(Boolean),
+          valid_until: memoryValidUntil || null,
+          supersedes_id: memorySupersedesId,
+          conversation_id: activeId,
+        }),
       });
       setMemories(await api<Memory[]>("/memories"));
       setMemoryDraft("");
+      setMemoryAttribution("user");
+      setMemoryInstrumentCodes("");
+      setMemoryValidUntil("");
+      setMemorySupersedesId(null);
+      setMemorySuggestion(null);
       notify("研究记忆已保存");
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "保存失败");
     } finally {
       setMemorySaving(false);
     }
+  }
+
+  function reviewMemoryProposal(proposal: MemorySuggestion) {
+    setMemoryKind(proposal.kind);
+    setMemoryDraft(proposal.statement);
+    setMemoryAttribution("agent_inference");
+    setMemoryInstrumentCodes(proposal.instrument_codes?.join(", ") || "");
+    setMemoryValidUntil(proposal.valid_until || "");
+    setMemorySupersedesId(null);
+    setMemorySuggestion(proposal);
+    setRightTab("memory");
+    setContextOpen(true);
+  }
+
+  function reviseMemory(memory: Memory) {
+    setMemoryKind(memory.kind);
+    setMemoryDraft(memory.statement);
+    setMemoryAttribution(memory.attribution);
+    setMemoryInstrumentCodes(memory.instrument_codes?.join(", ") || "");
+    setMemoryValidUntil(memory.valid_until || "");
+    setMemorySupersedesId(memory.id);
+    setMemorySuggestion({
+      kind: memory.kind,
+      statement: memory.statement,
+      attribution: memory.attribution,
+      stance: memory.stance,
+      supporting_evidence: memory.supporting_evidence || [],
+      counter_evidence: memory.counter_evidence || [],
+      invalidation_conditions: memory.invalidation_conditions || [],
+      instrument_codes: memory.instrument_codes || [],
+      valid_until: memory.valid_until,
+    });
+    setRightTab("memory");
+    setContextOpen(true);
   }
 
   async function deleteMemory(memory: Memory) {
@@ -645,7 +799,13 @@ export default function App() {
             </div>
           ) : (
             <div className="message-list">
-              {messages.map((message) => <MessageItem key={message.id} message={message} />)}
+              {messages.map((message) => (
+                <MessageItem
+                  key={message.id}
+                  message={message}
+                  onUseMemoryProposal={reviewMemoryProposal}
+                />
+              ))}
               {phase && sending && <div className="research-phase"><span className="status-indicator" />{phase}</div>}
             </div>
           )}
@@ -731,8 +891,12 @@ export default function App() {
               <div className="market-card">
                 <div className="market-advance"><span><TrendingUp size={13} /> 上涨</span><strong className="up-value">{overview.advances?.toLocaleString() ?? "—"}</strong></div>
                 <div className="market-advance"><span><TrendingDown size={13} /> 下跌</span><strong className="down-value">{overview.declines?.toLocaleString() ?? "—"}</strong></div>
+                <div className="market-advance"><span>涨停 / 跌停</span><strong>{overview.limit_up?.toLocaleString() ?? "—"} / {overview.limit_down?.toLocaleString() ?? "—"}</strong></div>
                 <div className="market-amount"><span>两市成交额</span><strong>{formatAmount(overview.total_amount)}</strong></div>
                 <small>来源：{overview.source}</small>
+                <small>涨跌停来源：{overview.limit_up_source || "缺失"} / {overview.limit_down_source || "缺失"}</small>
+                <small>交易日依据：{overview.trade_date_source || "未记录"}</small>
+                {overview.warning && <small className="market-warning">{overview.warning}</small>}
               </div>
             ) : (
               <button className="market-empty" onClick={() => void loadOverview()} disabled={overviewLoading}>
@@ -750,6 +914,12 @@ export default function App() {
               <span className="context-number">{memories.length.toString().padStart(2, "0")}</span>
             </div>
             <form className="memory-form" onSubmit={saveMemory}>
+              {memoryAttribution === "agent_inference" && (
+                <div className="memory-proposal-note">这是模型提出的研究记忆建议，确认后才会保存。</div>
+              )}
+              {memorySupersedesId && (
+                <div className="memory-proposal-note">保存后会保留这条历史记录，并将它标记为已替代。</div>
+              )}
               <label htmlFor="memory-kind">记忆类型</label>
               <select id="memory-kind" value={memoryKind} onChange={(event) => setMemoryKind(event.target.value as Memory["kind"])}>
                 <option value="hypothesis">研究假设</option><option value="preference">研究偏好</option>
@@ -758,6 +928,12 @@ export default function App() {
               <label htmlFor="memory-statement">记忆内容</label>
               <textarea id="memory-statement" rows={4} maxLength={6000} value={memoryDraft}
                 onChange={(event) => setMemoryDraft(event.target.value)} placeholder="写下假设、依据或失效条件…" />
+              <label htmlFor="memory-instruments">适用标的代码（可留空表示通用）</label>
+              <input id="memory-instruments" value={memoryInstrumentCodes}
+                onChange={(event) => setMemoryInstrumentCodes(event.target.value)} placeholder="600519, SSE:000001" />
+              <label htmlFor="memory-valid-until">有效期至（可选）</label>
+              <input id="memory-valid-until" type="date" value={memoryValidUntil}
+                onChange={(event) => setMemoryValidUntil(event.target.value)} />
               <button className="button button-dark memory-save" type="submit" disabled={!memoryDraft.trim() || memorySaving}>
                 {memorySaving ? <LoaderCircle size={14} className="spin" /> : <Plus size={14} />} 保存到长期记忆
               </button>
@@ -769,7 +945,16 @@ export default function App() {
                   <div className="memory-card-top"><span>{({ preference: "偏好", hypothesis: "假设", evidence: "证据", open_question: "待验证" } as const)[memory.kind]}</span>
                     <button aria-label="删除记忆" onClick={() => void deleteMemory(memory)}><Trash2 size={13} /></button></div>
                   <p>{memory.statement}</p>
-                  <small>{memory.attribution === "user" ? "你的记录" : "模型推断"}{memory.updated_at ? ` · ${dateLabel(memory.updated_at)}` : ""}</small>
+                  <small>
+                    {memory.attribution === "user" ? "你的记录" : "模型推断"}
+                    {memory.status === "superseded" ? " · 已替代" : ""}
+                    {memory.instrument_codes?.length ? ` · ${memory.instrument_codes.join(", ")}` : " · 通用"}
+                    {memory.valid_until ? ` · 有效至 ${memory.valid_until}` : ""}
+                    {memory.updated_at ? ` · ${dateLabel(memory.updated_at)}` : ""}
+                  </small>
+                  {memory.status === "active" && (
+                    <button className="trace-memory-accept" onClick={() => reviseMemory(memory)}>修订并替代</button>
+                  )}
                 </article>
               )) : <div className="empty-context memory-empty"><div className="empty-context-icon"><BookOpen size={16} /></div><strong>积累你的研究脉络</strong><span>保存假设和失效条件，AI 会在后续讨论中参考。</span></div>}
             </div>

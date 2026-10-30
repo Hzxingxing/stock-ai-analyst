@@ -1,8 +1,9 @@
-from datetime import UTC
+import re
+from datetime import UTC, date
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,7 +27,18 @@ class MemoryWrite(BaseModel):
     supporting_evidence: list[dict] = Field(default_factory=list, max_length=30)
     counter_evidence: list[dict] = Field(default_factory=list, max_length=30)
     invalidation_conditions: list[str] = Field(default_factory=list, max_length=30)
+    instrument_codes: list[str] = Field(default_factory=list, max_length=10)
+    valid_until: date | None = None
+    supersedes_id: str | None = None
     conversation_id: str | None = None
+
+    @field_validator("instrument_codes")
+    @classmethod
+    def normalize_instrument_codes(cls, values: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(value.strip().upper() for value in values if value.strip()))
+        if any(len(value) > 32 or not re.fullmatch(r"[A-Z0-9:_-]+", value) for value in normalized):
+            raise ValueError("适用标的请填写代码，如 600519 或 SSE:000001")
+        return normalized
 
 
 def _iso(value):
@@ -154,6 +166,7 @@ async def list_messages(
                         "name": tool.tool_name,
                         "input": tool.input_summary,
                         "output_summary": tool.output_summary,
+                        "evidence": tool.evidence_json,
                         "source": tool.source,
                         "data_as_of": tool.data_as_of,
                         "status": tool.status,
@@ -215,6 +228,10 @@ async def list_memories(
             "supporting_evidence": row.supporting_evidence or [],
             "counter_evidence": row.counter_evidence or [],
             "invalidation_conditions": row.invalidation_conditions or [],
+            "instrument_codes": row.instrument_codes or [],
+            "valid_until": row.valid_until.isoformat() if row.valid_until else None,
+            "status": row.status,
+            "supersedes_id": row.supersedes_id,
             "conversation_id": row.conversation_id,
             "created_at": _iso(row.created_at),
             "updated_at": _iso(row.updated_at),
@@ -237,7 +254,23 @@ async def create_memory(
         )
         if owned is None:
             raise HTTPException(status_code=404, detail="研究会话不存在")
-    memory = ResearchMemory(owner_id=user.id, **request.model_dump())
+    values = request.model_dump(exclude={"supersedes_id"})
+    if request.supersedes_id:
+        previous = await session.scalar(
+            select(ResearchMemory)
+            .where(
+                ResearchMemory.id == request.supersedes_id,
+                ResearchMemory.owner_id == user.id,
+            )
+            .with_for_update()
+        )
+        if previous is None:
+            raise HTTPException(status_code=404, detail="待替代的研究记忆不存在")
+        if previous.status != "active":
+            raise HTTPException(status_code=409, detail="这条研究记忆已被替代或停用")
+        previous.status = "superseded"
+        values["supersedes_id"] = previous.id
+    memory = ResearchMemory(owner_id=user.id, **values)
     session.add(memory)
     await session.commit()
     await session.refresh(memory)
@@ -266,7 +299,7 @@ async def update_memory(
     )
     if memory is None:
         raise HTTPException(status_code=404, detail="研究记忆不存在")
-    for key, value in request.model_dump().items():
+    for key, value in request.model_dump(exclude={"supersedes_id"}).items():
         setattr(memory, key, value)
     await session.commit()
     return {"id": memory.id, "statement": memory.statement, "kind": memory.kind}
@@ -281,10 +314,33 @@ async def delete_memory(
     memory = await session.scalar(
         select(ResearchMemory).where(
             ResearchMemory.id == memory_id, ResearchMemory.owner_id == user.id
-        )
+        ).with_for_update()
     )
     if memory is None:
         raise HTTPException(status_code=404, detail="研究记忆不存在")
+
+    successors = (
+        await session.scalars(
+            select(ResearchMemory)
+            .where(
+                ResearchMemory.owner_id == user.id,
+                ResearchMemory.supersedes_id == memory.id,
+            )
+            .with_for_update()
+        )
+    ).all()
+    for successor in successors:
+        successor.supersedes_id = memory.supersedes_id
+
+    if memory.status == "active" and memory.supersedes_id:
+        previous = await session.scalar(
+            select(ResearchMemory).where(
+                ResearchMemory.id == memory.supersedes_id,
+                ResearchMemory.owner_id == user.id,
+            ).with_for_update()
+        )
+        if previous is not None and previous.status == "superseded":
+            previous.status = "active"
     await session.delete(memory)
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

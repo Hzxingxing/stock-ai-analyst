@@ -1,10 +1,19 @@
-from datetime import date, datetime
+import json
+from datetime import date, datetime, timedelta
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
+SINA_EQUITY_DAILY_SOURCE = "AKShare / Sina stock_zh_a_daily"
+SINA_INDEX_DAILY_SOURCE = "AKShare / Sina stock_zh_index_daily"
+TENCENT_MARKET_SNAPSHOT_SOURCE = "AKShare / Tencent stock_zh_a_spot_tx"
+TENCENT_BEIJING_EQUITY_DAILY_SOURCE = "Tencent / appstock newfqkline"
+TENCENT_TURNOVER_TO_CNY = 10_000
+TENCENT_KLINE_URL = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
 
 
 def _number(value: Any) -> float | None:
@@ -38,7 +47,13 @@ def _market_timestamp(value: Any) -> pd.Timestamp | None:
     )
 
 
-def normalize_daily_frame(frame: pd.DataFrame) -> list[dict[str, Any]]:
+def normalize_daily_frame(
+    frame: pd.DataFrame,
+    *,
+    volume_scale: float = 1,
+    turnover_rate_scale: float = 1,
+    derive_change_pct: bool = False,
+) -> list[dict[str, Any]]:
     if frame is None or frame.empty:
         return []
     columns = {
@@ -50,7 +65,7 @@ def normalize_daily_frame(frame: pd.DataFrame) -> list[dict[str, Any]]:
         "volume": ("成交量", "volume"),
         "amount": ("成交额", "amount"),
         "change_pct": ("涨跌幅", "change_pct", "涨跌幅(%)"),
-        "turnover_rate": ("换手率", "turnover_rate"),
+        "turnover_rate": ("换手率", "turnover_rate", "turnover"),
     }
     matched = {key: _first_column(frame, *aliases) for key, aliases in columns.items()}
     if matched["trade_date"] is None:
@@ -64,9 +79,96 @@ def normalize_daily_frame(frame: pd.DataFrame) -> list[dict[str, Any]]:
         normalized = {"trade_date": trade_date.date()}
         for key, column in matched.items():
             if key != "trade_date":
-                normalized[key] = _number(row[column]) if column is not None else None
+                value = _number(row[column]) if column is not None else None
+                if value is not None and key == "volume":
+                    value *= volume_scale
+                elif value is not None and key == "turnover_rate":
+                    value *= turnover_rate_scale
+                normalized[key] = value
         rows.append(normalized)
+    rows.sort(key=lambda item: item["trade_date"])
+    if derive_change_pct:
+        previous_close = None
+        for row in rows:
+            close = row["close"]
+            if row["change_pct"] is None and previous_close not in (None, 0) and close is not None:
+                row["change_pct"] = (close / previous_close - 1) * 100
+            if close is not None:
+                previous_close = close
     return rows
+
+
+def _sina_equity_symbol(provider_symbol: str) -> str:
+    if provider_symbol.startswith(("sh", "sz", "bj")):
+        return provider_symbol
+    if provider_symbol.startswith(("6", "9")):
+        return f"sh{provider_symbol}"
+    if provider_symbol.startswith(("4", "8")):
+        return f"bj{provider_symbol}"
+    return f"sz{provider_symbol}"
+
+
+def _beijing_equity_symbol(provider_symbol: str) -> str | None:
+    symbol = provider_symbol.strip().lower()
+    if symbol.startswith("bj"):
+        return symbol
+    if symbol.startswith(("4", "8", "92")):
+        return f"bj{symbol}"
+    return None
+
+
+def _fetch_tencent_beijing_daily_frame(
+    symbol: str, start_date: date, end_date: date, adjustment: str
+) -> pd.DataFrame:
+    adjustment_code = {"qfq": "qfq", "hfq": "hfq", "none": ""}[adjustment]
+    result_rows = []
+    for year in range(start_date.year, end_date.year + 1):
+        request_start = max(start_date, date(year, 1, 1))
+        request_end = min(end_date, date(year, 12, 31))
+        params = {
+            "_var": f"kline_day{adjustment_code}{year}",
+            "param": (
+                f"{symbol},day,{request_start},{request_end},640,{adjustment_code}"
+            ),
+            "r": "0.8205512681390605",
+        }
+        request = Request(f"{TENCENT_KLINE_URL}?{urlencode(params)}")
+        with urlopen(request, timeout=10) as response:
+            body = response.read().decode("utf-8")
+        _, separator, json_text = body.partition("=")
+        if not separator:
+            raise ValueError("Tencent 北京个股日线响应格式异常")
+        payload = json.loads(json_text.strip().rstrip(";"))
+        if str(payload.get("code")) != "0":
+            raise ValueError("Tencent 北京个股日线接口未返回成功状态")
+        symbol_data = payload.get("data", {}).get(symbol)
+        data_key = {"qfq": "qfqday", "hfq": "hfqday", "none": "day"}[adjustment]
+        if symbol_data is None or data_key not in symbol_data:
+            raise ValueError(f"Tencent 北京个股日线缺少 {adjustment} 数据")
+        for values in symbol_data[data_key]:
+            if len(values) < 9:
+                raise ValueError("Tencent 北京个股日线记录字段不完整")
+            amount = _number(values[8])
+            result_rows.append({
+                "date": values[0],
+                "open": values[1],
+                "close": values[2],
+                "high": values[3],
+                "low": values[4],
+                "volume": values[5],
+                "turnover_rate": values[7],
+                "amount": amount * TENCENT_TURNOVER_TO_CNY if amount is not None else None,
+            })
+    return pd.DataFrame(result_rows)
+
+
+def _date_range(
+    records: list[dict[str, Any]], start_date: date, end_date: date
+) -> list[dict[str, Any]]:
+    return [
+        record for record in records
+        if start_date <= record["trade_date"] <= end_date
+    ]
 
 
 def fetch_daily_bars(
@@ -75,26 +177,52 @@ def fetch_daily_bars(
     start_date: date,
     end_date: date,
     adjustment: str,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     import akshare as ak
 
-    start = start_date.strftime("%Y%m%d")
-    end = end_date.strftime("%Y%m%d")
     if instrument_type == "index":
-        frame = ak.stock_zh_index_daily_em(
-            symbol=provider_symbol, start_date=start, end_date=end
+        return fetch_index_bars(provider_symbol, start_date, end_date)
+
+    adjustment_code = {"qfq": "qfq", "hfq": "hfq", "none": ""}[adjustment]
+    beijing_symbol = _beijing_equity_symbol(provider_symbol)
+    if beijing_symbol:
+        frame = _fetch_tencent_beijing_daily_frame(
+            beijing_symbol, start_date - timedelta(days=14), end_date, adjustment
         )
-    else:
-        adjustment_code = {"qfq": "qfq", "hfq": "hfq", "none": ""}[adjustment]
-        frame = ak.stock_zh_a_hist(
-            symbol=provider_symbol,
-            period="daily",
-            start_date=start,
-            end_date=end,
-            adjust=adjustment_code,
-            timeout=20,
-        )
-    return normalize_daily_frame(frame)
+        records = normalize_daily_frame(frame, derive_change_pct=True)
+        return {
+            "records": _date_range(records, start_date, end_date),
+            "source": TENCENT_BEIJING_EQUITY_DAILY_SOURCE,
+            "units": {
+                "volume": "lot (Tencent Beijing kline native volume)",
+                "amount": "CNY (Tencent turnover normalized from 10,000 CNY)",
+                "change_pct": "% (derived from consecutive adjusted closes)",
+                "turnover_rate": "%",
+            },
+        }
+
+    frame = ak.stock_zh_a_daily(
+        symbol=_sina_equity_symbol(provider_symbol),
+        start_date=(start_date - timedelta(days=14)).strftime("%Y%m%d"),
+        end_date=end_date.strftime("%Y%m%d"),
+        adjust=adjustment_code,
+    )
+    records = normalize_daily_frame(
+        frame,
+        volume_scale=0.01,
+        turnover_rate_scale=100,
+        derive_change_pct=True,
+    )
+    return {
+        "records": _date_range(records, start_date, end_date),
+        "source": SINA_EQUITY_DAILY_SOURCE,
+        "units": {
+            "volume": "lot (Sina shares converted at 100 shares per lot)",
+            "amount": "CNY",
+            "change_pct": "% (derived from consecutive adjusted closes)",
+            "turnover_rate": "% (Sina fraction converted to percent)",
+        },
+    }
 
 
 def fetch_intraday_bars(provider_symbol: str, period: str) -> list[dict[str, Any]]:
@@ -149,12 +277,59 @@ def fetch_recent_trades(provider_symbol: str) -> list[dict[str, Any]]:
     ]
 
 
+def fetch_current_quote(provider_symbol: str) -> dict[str, Any]:
+    import akshare as ak
+
+    normalized_symbol = provider_symbol.strip().upper()
+    if not normalized_symbol.startswith(("SH", "SZ", "BJ")):
+        normalized_symbol = _code_market_prefix(provider_symbol)
+    frame = ak.stock_individual_spot_xq(symbol=normalized_symbol)
+    if frame is None or frame.empty or not {"item", "value"}.issubset(frame.columns):
+        raise ValueError("雪球实时行情缺少 item/value 字段")
+    fields = {
+        "price": ("现价", "最新价"),
+        "previous_close": ("昨收", "前收"),
+        "change_pct": ("涨幅", "涨跌幅"),
+        "change": ("涨跌", "涨跌额"),
+        "open": ("今开", "开盘"),
+        "high": ("最高",),
+        "low": ("最低",),
+        "amount": ("成交额",),
+        "volume": ("成交量",),
+        "turnover_rate": ("周转率", "换手率"),
+        "pe_ttm": ("市盈率(TTM)",),
+        "pb": ("市净率",),
+    }
+    values = {}
+    for field, aliases in fields.items():
+        matching = frame[frame["item"].isin(aliases)]
+        values[field] = _number(matching.iloc[0]["value"]) if not matching.empty else None
+    time_rows = frame[frame["item"] == "时间"]
+    market_time = str(time_rows.iloc[0]["value"]) if not time_rows.empty else None
+    if values["price"] is None:
+        raise ValueError("雪球实时行情没有返回有效现价")
+    return {
+        "symbol": normalized_symbol,
+        "observed_at": datetime.now(tz=MARKET_TIMEZONE).isoformat(timespec="seconds"),
+        "market_time": market_time,
+        "quote": values,
+        "source": "Xueqiu / stock_individual_spot_xq",
+        "units": {
+            "price": "CNY/share or index point",
+            "change_pct": "%",
+            "turnover_rate": "provider-native scale",
+            "amount": "provider-native scale; not normalized",
+            "volume": "provider-native scale; not normalized",
+        },
+    }
+
+
 def search_equities(query: str) -> list[dict[str, str]]:
     import akshare as ak
 
     frame = ak.stock_info_a_code_name()
     if frame is None or frame.empty:
-        return []
+        raise ValueError("AKShare 股票目录未返回记录")
     code_column = _first_column(frame, "code", "代码")
     name_column = _first_column(frame, "name", "名称")
     if not code_column or not name_column:
@@ -170,24 +345,61 @@ def search_equities(query: str) -> list[dict[str, str]]:
     ]
 
 
-def fetch_market_snapshot() -> list[dict[str, Any]]:
+def fetch_market_snapshot() -> dict[str, Any]:
     import akshare as ak
 
-    frame = ak.stock_zh_a_spot_em()
-    if frame is None or frame.empty:
-        return []
+    frame = ak.stock_zh_a_spot_tx()
+    required_columns = {"code", "name", "zdf", "volume", "turnover"}
+    if frame is not None and not frame.empty and not required_columns.issubset(frame.columns):
+        raise ValueError("Tencent 市场快照字段不完整")
     records = []
-    for _, row in frame.iterrows():
-        record = {}
-        for key, value in row.items():
-            if value is None or pd.isna(value):
-                record[str(key)] = None
-            elif hasattr(value, "item"):
-                record[str(key)] = value.item()
-            else:
-                record[str(key)] = value
-        records.append(record)
-    return records
+    if frame is not None and not frame.empty:
+        for _, row in frame.iterrows():
+            turnover = _number(row["turnover"])
+            records.append({
+                "code": str(row["code"]),
+                "name": str(row["name"]),
+                "change_pct": _number(row["zdf"]),
+                "volume": _number(row["volume"]),
+                # Tencent reports turnover in 10,000 CNY; volume is in lots.
+                "amount": turnover * TENCENT_TURNOVER_TO_CNY if turnover is not None else None,
+            })
+    return {
+        "records": records,
+        "source": TENCENT_MARKET_SNAPSHOT_SOURCE,
+        "units": {"volume": "lot (100 shares)", "amount": "CNY"},
+    }
+
+
+def fetch_market_limit_statistics(trade_date: date | str) -> dict[str, Any]:
+    """Count Eastmoney's dated limit-up/down pools; an empty successful pool means zero."""
+    import akshare as ak
+
+    target = date.fromisoformat(trade_date) if isinstance(trade_date, str) else trade_date
+    date_text = target.strftime("%Y%m%d")
+    result: dict[str, Any] = {
+        "trade_date": target.isoformat(),
+        "limit_up": None,
+        "limit_down": None,
+        "limit_up_source": None,
+        "limit_down_source": None,
+        "errors": {},
+    }
+    for field, function, source in (
+        ("limit_up", ak.stock_zt_pool_em, "Eastmoney stock_zt_pool_em"),
+        ("limit_down", ak.stock_zt_pool_dtgc_em, "Eastmoney stock_zt_pool_dtgc_em"),
+    ):
+        try:
+            frame = function(date=date_text)
+            if frame is None:
+                raise ValueError("数据源未返回涨跌停列表")
+            result[field] = len(frame)
+            result[f"{field}_source"] = source
+        except Exception as exc:  # noqa: BLE001 - preserve independent field availability
+            result["errors"][field] = type(exc).__name__
+    if result["errors"]:
+        result["warning"] = "涨跌停统计存在缺失，未成功的字段保持为空。"
+    return result
 
 
 def _code_market_prefix(provider_symbol: str) -> str:
@@ -416,12 +628,21 @@ def fetch_company_research(provider_symbol: str, dataset: str) -> dict[str, Any]
     raise ValueError("unsupported company dataset")
 
 
-def fetch_index_bars(provider_symbol: str, start_date: date, end_date: date) -> list[dict[str, Any]]:
+def fetch_index_bars(
+    provider_symbol: str, start_date: date, end_date: date
+) -> dict[str, Any]:
     import akshare as ak
 
-    frame = ak.stock_zh_index_daily_em(
-        symbol=provider_symbol,
-        start_date=start_date.strftime("%Y%m%d"),
-        end_date=end_date.strftime("%Y%m%d"),
+    frame = ak.stock_zh_index_daily(symbol=provider_symbol)
+    records = normalize_daily_frame(
+        frame, volume_scale=0.01, derive_change_pct=True
     )
-    return normalize_daily_frame(frame)
+    return {
+        "records": _date_range(records, start_date, end_date),
+        "source": SINA_INDEX_DAILY_SOURCE,
+        "units": {
+            "volume": "lot (Sina index shares converted at 100 shares per lot)",
+            "amount": "not provided by Sina",
+            "change_pct": "% (derived from consecutive closes)",
+        },
+    }

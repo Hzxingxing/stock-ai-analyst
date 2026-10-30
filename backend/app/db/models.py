@@ -105,6 +105,7 @@ class ToolExecution(Base):
     tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
     input_summary: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     output_summary: Mapped[str | None] = mapped_column(Text)
+    evidence_json: Mapped[dict | None] = mapped_column("evidence", JSON)
     source: Mapped[str | None] = mapped_column(String(200))
     data_as_of: Mapped[str | None] = mapped_column(String(40))
     status: Mapped[str] = mapped_column(
@@ -121,7 +122,10 @@ class ToolExecution(Base):
 
 class ResearchMemory(Base):
     __tablename__ = "research_memories"
-    __table_args__ = (Index("ix_memory_owner_updated", "owner_id", "updated_at"),)
+    __table_args__ = (
+        Index("ix_memory_owner_updated", "owner_id", "updated_at"),
+        Index("ix_memory_owner_status_validity", "owner_id", "status", "valid_until"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     owner_id: Mapped[str] = mapped_column(
@@ -139,6 +143,14 @@ class ResearchMemory(Base):
     supporting_evidence: Mapped[list | None] = mapped_column(JSON)
     counter_evidence: Mapped[list | None] = mapped_column(JSON)
     invalidation_conditions: Mapped[list | None] = mapped_column(JSON)
+    instrument_codes: Mapped[list | None] = mapped_column(JSON, default=list)
+    valid_until: Mapped[date | None] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", server_default="active"
+    )
+    supersedes_id: Mapped[str | None] = mapped_column(
+        ForeignKey("research_memories.id", ondelete="SET NULL")
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
     )
@@ -228,6 +240,9 @@ class MarketStatistic(Base):
     unchanged: Mapped[int | None] = mapped_column(Integer)
     limit_up: Mapped[int | None] = mapped_column(Integer)
     limit_down: Mapped[int | None] = mapped_column(Integer)
+    limit_up_source: Mapped[str | None] = mapped_column(String(100))
+    limit_down_source: Mapped[str | None] = mapped_column(String(100))
+    trade_date_source: Mapped[str | None] = mapped_column(String(100))
     total_volume: Mapped[float | None] = mapped_column(Float)
     total_amount: Mapped[float | None] = mapped_column(Float)
     source: Mapped[str] = mapped_column(
